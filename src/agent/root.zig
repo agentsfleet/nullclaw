@@ -399,6 +399,12 @@ pub const Agent = struct {
     /// Total tokens used across all turns.
     total_tokens: u64 = 0,
 
+    /// Cumulative prompt-side tokens across all turns (split of `total_tokens`).
+    prompt_tokens_total: u64 = 0,
+
+    /// Cumulative completion-side tokens across all turns (split of `total_tokens`).
+    completion_tokens_total: u64 = 0,
+
     /// Total cost in USD across all turns.
     total_cost_usd: f64 = 0,
 
@@ -2473,6 +2479,8 @@ pub const Agent = struct {
             response.usage = normalized_usage;
 
             self.total_tokens += normalized_usage.total_tokens;
+            self.prompt_tokens_total += normalized_usage.prompt_tokens;
+            self.completion_tokens_total += normalized_usage.completion_tokens;
             self.total_cost_usd += cost_mod.TokenUsage.fromProviders(turn_model_name, normalized_usage).cost();
             self.last_turn_usage = normalized_usage;
             if (normalized_usage.total_tokens > 0) {
@@ -2891,6 +2899,8 @@ pub const Agent = struct {
         }
         summary_response.usage = normalized_summary_usage;
         self.total_tokens += normalized_summary_usage.total_tokens;
+        self.prompt_tokens_total += normalized_summary_usage.prompt_tokens;
+        self.completion_tokens_total += normalized_summary_usage.completion_tokens;
         self.total_cost_usd += cost_mod.TokenUsage.fromProviders(self.model_name, normalized_summary_usage).cost();
         self.last_turn_usage = normalized_summary_usage;
         if (normalized_summary_usage.total_tokens > 0) {
@@ -3850,6 +3860,16 @@ pub const Agent = struct {
         return self.total_tokens;
     }
 
+    /// Cumulative prompt-side tokens across all turns.
+    pub fn promptTokensUsed(self: *const Agent) u64 {
+        return self.prompt_tokens_total;
+    }
+
+    /// Cumulative completion-side tokens across all turns.
+    pub fn completionTokensUsed(self: *const Agent) u64 {
+        return self.completion_tokens_total;
+    }
+
     /// Get current history length.
     pub fn historyLen(self: *const Agent) usize {
         return self.history.items.len;
@@ -4231,6 +4251,14 @@ test "Agent tokens tracking" {
     try std.testing.expectEqual(@as(u64, 100), agent.tokensUsed());
     agent.total_tokens += 50;
     try std.testing.expectEqual(@as(u64, 150), agent.tokensUsed());
+
+    // Split accessors mirror their cumulative fields and default to zero.
+    try std.testing.expectEqual(@as(u64, 0), agent.promptTokensUsed());
+    try std.testing.expectEqual(@as(u64, 0), agent.completionTokensUsed());
+    agent.prompt_tokens_total = 90;
+    agent.completion_tokens_total = 60;
+    try std.testing.expectEqual(@as(u64, 90), agent.promptTokensUsed());
+    try std.testing.expectEqual(@as(u64, 60), agent.completionTokensUsed());
 }
 
 test "Agent trimHistory no-op when under limit" {
@@ -5360,6 +5388,8 @@ test "slash /new clears history" {
     });
     agent.has_system_prompt = true;
     agent.total_tokens = 42;
+    agent.prompt_tokens_total = 30;
+    agent.completion_tokens_total = 12;
     agent.last_turn_usage = .{ .prompt_tokens = 10, .completion_tokens = 5, .total_tokens = 15 };
 
     const response = (try agent.handleSlashCommand("/new")).?;
@@ -5369,6 +5399,10 @@ test "slash /new clears history" {
     try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
     try std.testing.expect(!agent.has_system_prompt);
     try std.testing.expectEqual(@as(u64, 0), agent.total_tokens);
+    // The split counters reset with the session too — else by-side metering
+    // carries stale per-session figures after /new.
+    try std.testing.expectEqual(@as(u64, 0), agent.promptTokensUsed());
+    try std.testing.expectEqual(@as(u64, 0), agent.completionTokensUsed());
     try std.testing.expectEqual(@as(u32, 0), agent.last_turn_usage.total_tokens);
 }
 
