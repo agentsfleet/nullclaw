@@ -1990,6 +1990,16 @@ test "credentialed curl argv validation permits non-secret headers" {
     try validateNoCredentialedCurlArgs("https://example.com/v1", &.{"User-Agent: nullclaw-test"});
 }
 
+test "remote credentialed request takes the pinned curl path, not the std.http fallback" {
+    // DNS-rebinding TOCTOU guard: a remote credentialed dial (non-null resolve pin)
+    // must NOT fall back to std.http — that path re-resolves the host at connect and
+    // discards the validated address. The fallback is reserved for an explicit local
+    // host (null pin), which carries no rebinding risk.
+    const auth = [_][]const u8{"Authorization: Bearer sk-test-not-real"};
+    try std.testing.expect(!credentialedCurlUsesHttpFallback("https://api.example.com/v1", &auth, "api.example.com:443:203.0.113.7"));
+    try std.testing.expect(credentialedCurlUsesHttpFallback("http://127.0.0.1:11434/v1", &auth, null));
+}
+
 test "buildSafeResolveEntryForRemoteUrl allows explicit local host without pinning" {
     try std.testing.expect((try buildSafeResolveEntryForRemoteUrl(std.testing.allocator, "http://127.0.0.1:11434/api/chat")) == null);
 }
