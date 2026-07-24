@@ -3314,6 +3314,12 @@ fn clearSessionState(self: anytype) void {
     if (@hasField(@TypeOf(self.*), "total_tokens")) {
         self.total_tokens = 0;
     }
+    if (@hasField(@TypeOf(self.*), "prompt_tokens_total")) {
+        self.prompt_tokens_total = 0;
+    }
+    if (@hasField(@TypeOf(self.*), "completion_tokens_total")) {
+        self.completion_tokens_total = 0;
+    }
     if (@hasField(@TypeOf(self.*), "last_turn_usage")) {
         self.last_turn_usage = .{};
     }

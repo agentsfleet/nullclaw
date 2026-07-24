@@ -502,35 +502,44 @@ pub fn convertToolsResponses(buf: *std.ArrayListUnmanaged(u8), allocator: std.me
 /// HTTP POST with optional LLM timeout (seconds). 0 = no limit.
 /// Automatically reads proxy from HTTPS_PROXY, HTTP_PROXY, or ALL_PROXY environment variables.
 pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []const u8, headers: []const []const u8, timeout_secs: u64) ![]u8 {
-    _ = timeout_secs;
     const resolve_entry = http_util.buildSafeResolveEntryForRemoteUrl(allocator, url) catch |err| switch (err) {
         error.InvalidUrl, error.HostResolutionFailed, error.LocalAddressBlocked => return err,
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer if (resolve_entry) |entry| allocator.free(entry);
-    // Provider requests often carry Authorization/x-api-key credentials.
-    // Use std.http so secrets are never exposed through child process argv.
-    return http_util.httpPostJsonWithProxy(allocator, url, body, headers, null);
+    // Thread the SSRF-safe resolve pin (built above) through to the dial: the request
+    // must reach the validated address, never one re-resolved at connect time — that
+    // gap is a DNS-rebinding TOCTOU (the prior std.http call discarded the pin).
+    // curlPostWithProxyAndResolve pins a remote host with curl --resolve AND keeps
+    // Authorization/x-api-key off the child argv (headers go to a 0600 temp file, the
+    // body rides stdin); an explicit local host yields a null pin and falls back to
+    // std.http, which needs none.
+    var timeout_buf: [20]u8 = undefined;
+    const max_time: ?[]const u8 = if (timeout_secs == 0)
+        null
+    else
+        std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch null;
+    return http_util.curlPostWithProxyAndResolve(allocator, url, body, headers, null, max_time, resolve_entry);
 }
 
 /// HTTP POST (application/x-www-form-urlencoded) with optional timeout.
 /// Automatically reads proxy from HTTPS_PROXY, HTTP_PROXY, or ALL_PROXY environment variables.
 pub fn curlPostFormTimed(allocator: std.mem.Allocator, url: []const u8, body: []const u8, timeout_secs: u64) ![]u8 {
-    _ = timeout_secs;
     const resolve_entry = http_util.buildSafeResolveEntryForRemoteUrl(allocator, url) catch |err| switch (err) {
         error.InvalidUrl, error.HostResolutionFailed, error.LocalAddressBlocked => return err,
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer if (resolve_entry) |entry| allocator.free(entry);
-    return http_util.httpRequest(
-        allocator,
-        .POST,
-        url,
-        body,
-        &.{},
-        "application/x-www-form-urlencoded",
-        null,
-    );
+    // Same DNS-rebinding TOCTOU fix as curlPostTimed: thread the resolve pin so the
+    // form POST (OAuth token exchange) dials the validated address.
+    // curlPostFormWithProxyAndResolve pins a remote host via curl --resolve (body on
+    // stdin); a local host (null pin) uses the std.http fallback.
+    var timeout_buf: [20]u8 = undefined;
+    const max_time: ?[]const u8 = if (timeout_secs == 0)
+        null
+    else
+        std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch null;
+    return http_util.curlPostFormWithProxyAndResolve(allocator, url, body, null, max_time, resolve_entry);
 }
 
 // ════════════════════════════════════════════════════════════════════════════

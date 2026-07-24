@@ -602,6 +602,12 @@ fn mapResolveConnectHostError(host: []const u8, err: net_security.ResolveConnect
 
 pub fn appendCurlResolveArgs(argv_buf: []([]const u8), argc: *usize, resolve_entry: ?[]const u8) void {
     if (resolve_entry) |entry| {
+        // A forward proxy resolves the origin itself, bypassing curl's --resolve
+        // pin. Force pinned requests direct even when proxy env vars are set.
+        argv_buf[argc.*] = "--noproxy";
+        argc.* += 1;
+        argv_buf[argc.*] = "*";
+        argc.* += 1;
         argv_buf[argc.*] = "--resolve";
         argc.* += 1;
         argv_buf[argc.*] = entry;
@@ -1306,12 +1312,7 @@ fn curlGetWithProxyAndResolve(
         argc += 1;
     }
 
-    if (resolve_entry) |entry| {
-        argv_buf[argc] = "--resolve";
-        argc += 1;
-        argv_buf[argc] = entry;
-        argc += 1;
-    }
+    appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
 
     try appendPreparedCurlHeaders(argv_buf[0..], &argc, headers, prepared_headers.arg);
 
@@ -1990,6 +1991,16 @@ test "credentialed curl argv validation permits non-secret headers" {
     try validateNoCredentialedCurlArgs("https://example.com/v1", &.{"User-Agent: nullclaw-test"});
 }
 
+test "remote credentialed request takes the pinned curl path, not the std.http fallback" {
+    // DNS-rebinding TOCTOU guard: a remote credentialed dial (non-null resolve pin)
+    // must NOT fall back to std.http — that path re-resolves the host at connect and
+    // discards the validated address. The fallback is reserved for an explicit local
+    // host (null pin), which carries no rebinding risk.
+    const auth = [_][]const u8{"Authorization: Bearer sk-test-not-real"};
+    try std.testing.expect(!credentialedCurlUsesHttpFallback("https://api.example.com/v1", &auth, "api.example.com:443:203.0.113.7"));
+    try std.testing.expect(credentialedCurlUsesHttpFallback("http://127.0.0.1:11434/v1", &auth, null));
+}
+
 test "buildSafeResolveEntryForRemoteUrl allows explicit local host without pinning" {
     try std.testing.expect((try buildSafeResolveEntryForRemoteUrl(std.testing.allocator, "http://127.0.0.1:11434/api/chat")) == null);
 }
@@ -2008,13 +2019,15 @@ test "buildSafeResolveEntryForRemoteUrl rejects malformed URL" {
     try std.testing.expectError(error.InvalidUrl, buildSafeResolveEntryForRemoteUrl(std.testing.allocator, "notaurl"));
 }
 
-test "appendCurlResolveArgs appends resolve flag and target" {
+test "appendCurlResolveArgs forces pinned requests past environment proxies" {
     var argv_buf: [4][]const u8 = undefined;
     var argc: usize = 0;
     appendCurlResolveArgs(argv_buf[0..], &argc, "example.com:443:203.0.113.7");
-    try std.testing.expectEqual(@as(usize, 2), argc);
-    try std.testing.expectEqualStrings("--resolve", argv_buf[0]);
-    try std.testing.expectEqualStrings("example.com:443:203.0.113.7", argv_buf[1]);
+    try std.testing.expectEqual(@as(usize, 4), argc);
+    try std.testing.expectEqualStrings("--noproxy", argv_buf[0]);
+    try std.testing.expectEqualStrings("*", argv_buf[1]);
+    try std.testing.expectEqualStrings("--resolve", argv_buf[2]);
+    try std.testing.expectEqualStrings("example.com:443:203.0.113.7", argv_buf[3]);
 }
 
 test "appendCurlResolveArgs skips null entry" {
