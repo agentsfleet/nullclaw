@@ -1493,8 +1493,11 @@ pub const SessionManager = struct {
                 }
                 if (try store.loadUsage(session_key)) |total_tokens| {
                     session.agent.total_tokens = total_tokens;
+                    session.agent.completion_tokens_total = @min(total_tokens, estimateRestoredSessionTokens(entries));
+                    session.agent.prompt_tokens_total = total_tokens - session.agent.completion_tokens_total;
                 } else if (entries.len > 0) {
                     session.agent.total_tokens = estimateRestoredSessionTokens(entries);
+                    session.agent.completion_tokens_total = session.agent.total_tokens;
                 }
             }
         }
@@ -4681,12 +4684,16 @@ test "restored session reconstructs token count from persisted assistant replies
     const expected_tokens = agent_mod.estimate_text_tokens("assistant reply");
     const first_session = try sm.getOrCreate(session_key);
     try testing.expectEqual(@as(u64, expected_tokens), first_session.agent.total_tokens);
+    try testing.expectEqual(@as(u64, 0), first_session.agent.promptTokensUsed());
+    try testing.expectEqual(@as(u64, expected_tokens), first_session.agent.completionTokensUsed());
 
     first_session.last_active = 0;
     try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
 
     const restored_session = try sm.getOrCreate(session_key);
     try testing.expectEqual(@as(u64, expected_tokens), restored_session.agent.total_tokens);
+    try testing.expectEqual(@as(u64, 0), restored_session.agent.promptTokensUsed());
+    try testing.expectEqual(@as(u64, expected_tokens), restored_session.agent.completionTokensUsed());
 
     const status = try restored_session.agent.handleSlashCommand("/status");
     defer {

@@ -59,6 +59,49 @@ pub fn estimate_text_tokens(text: []const u8) u32 {
     return @intCast((text.len + 3) / 4);
 }
 
+fn estimateResponseCompletionTokens(response: *const ChatResponse) u32 {
+    var total = estimate_text_tokens(response.contentOrEmpty());
+    if (response.reasoning_content) |reasoning| total +|= estimate_text_tokens(reasoning);
+    for (response.tool_calls) |call| {
+        total +|= estimate_text_tokens(call.id);
+        total +|= estimate_text_tokens(call.name);
+        total +|= estimate_text_tokens(call.arguments);
+    }
+    return total;
+}
+
+fn normalizeTokenUsage(usage: providers.TokenUsage, completion_estimate: u32) providers.TokenUsage {
+    var normalized = usage;
+    if (normalized.total_tokens == 0 and
+        (normalized.prompt_tokens > 0 or normalized.completion_tokens > 0))
+    {
+        normalized.total_tokens = normalized.prompt_tokens +| normalized.completion_tokens;
+    }
+
+    const split_total = normalized.prompt_tokens +| normalized.completion_tokens;
+    if (normalized.total_tokens > split_total) {
+        const unassigned = normalized.total_tokens - split_total;
+        if (normalized.prompt_tokens == 0 and normalized.completion_tokens == 0) {
+            normalized.completion_tokens = @min(normalized.total_tokens, completion_estimate);
+            normalized.prompt_tokens = normalized.total_tokens - normalized.completion_tokens;
+        } else if (normalized.prompt_tokens == 0) {
+            normalized.prompt_tokens = unassigned;
+        } else {
+            normalized.completion_tokens += unassigned;
+        }
+    } else if (normalized.total_tokens > 0 and split_total > normalized.total_tokens) {
+        normalized.prompt_tokens = @min(normalized.prompt_tokens, normalized.total_tokens);
+        normalized.completion_tokens = normalized.total_tokens - normalized.prompt_tokens;
+    }
+
+    // Some providers/channels omit usage entirely; keep status counters useful.
+    if (normalized.total_tokens == 0 and completion_estimate > 0) {
+        normalized.completion_tokens = completion_estimate;
+        normalized.total_tokens = normalized.completion_tokens;
+    }
+    return normalized;
+}
+
 // ─── Progress hints ──────────────────────────────────────────────────────────
 
 /// Progress hint emitted during a turn. For tool-call starts, text is the tool name.
@@ -2426,18 +2469,7 @@ pub const Agent = struct {
 
             const response_text = response.contentOrEmpty();
 
-            // Track tokens with provider-agnostic fallback when total is omitted.
-            var normalized_usage = response.usage;
-            if (normalized_usage.total_tokens == 0 and
-                (normalized_usage.prompt_tokens > 0 or normalized_usage.completion_tokens > 0))
-            {
-                normalized_usage.total_tokens = normalized_usage.prompt_tokens +| normalized_usage.completion_tokens;
-            }
-            // Some providers/channels omit usage entirely; keep status counters useful.
-            if (normalized_usage.total_tokens == 0 and normalized_usage.prompt_tokens == 0 and normalized_usage.completion_tokens == 0 and response_text.len > 0) {
-                normalized_usage.completion_tokens = estimate_text_tokens(response_text);
-                normalized_usage.total_tokens = normalized_usage.completion_tokens;
-            }
+            const normalized_usage = normalizeTokenUsage(response.usage, estimateResponseCompletionTokens(&response));
             response.usage = normalized_usage;
 
             self.total_tokens += normalized_usage.total_tokens;
@@ -2845,20 +2877,7 @@ pub const Agent = struct {
         self.logLlmResponse(self.max_tool_iterations + 1, 1, &summary_response);
         const summary_duration_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - summary_timer_start)));
         const summary_text = summary_response.contentOrEmpty();
-        var normalized_summary_usage = summary_response.usage;
-        if (normalized_summary_usage.total_tokens == 0 and
-            (normalized_summary_usage.prompt_tokens > 0 or normalized_summary_usage.completion_tokens > 0))
-        {
-            normalized_summary_usage.total_tokens = normalized_summary_usage.prompt_tokens +| normalized_summary_usage.completion_tokens;
-        }
-        if (normalized_summary_usage.total_tokens == 0 and
-            normalized_summary_usage.prompt_tokens == 0 and
-            normalized_summary_usage.completion_tokens == 0 and
-            summary_text.len > 0)
-        {
-            normalized_summary_usage.completion_tokens = estimate_text_tokens(summary_text);
-            normalized_summary_usage.total_tokens = normalized_summary_usage.completion_tokens;
-        }
+        const normalized_summary_usage = normalizeTokenUsage(summary_response.usage, estimateResponseCompletionTokens(&summary_response));
         summary_response.usage = normalized_summary_usage;
         self.total_tokens += normalized_summary_usage.total_tokens;
         self.prompt_tokens_total += normalized_summary_usage.prompt_tokens;
@@ -4121,6 +4140,33 @@ test "Agent tokens tracking" {
     agent.completion_tokens_total = 60;
     try std.testing.expectEqual(@as(u64, 90), agent.promptTokensUsed());
     try std.testing.expectEqual(@as(u64, 60), agent.completionTokensUsed());
+}
+
+test "normalizeTokenUsage backfills split when provider reports only total" {
+    // Regression: total-only providers must not leave cumulative billing splits at zero.
+    const usage = normalizeTokenUsage(.{ .total_tokens = 5 }, estimate_text_tokens("summary"));
+    try std.testing.expectEqual(@as(u32, 3), usage.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 2), usage.completion_tokens);
+    try std.testing.expectEqual(@as(u32, 5), usage.total_tokens);
+}
+
+test "normalizeTokenUsage reconciles incomplete and excessive provider splits" {
+    const incomplete = normalizeTokenUsage(.{ .prompt_tokens = 3, .completion_tokens = 2, .total_tokens = 10 }, 0);
+    try std.testing.expectEqual(@as(u32, 3), incomplete.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 7), incomplete.completion_tokens);
+
+    const excessive = normalizeTokenUsage(.{ .prompt_tokens = 8, .completion_tokens = 6, .total_tokens = 10 }, 0);
+    try std.testing.expectEqual(@as(u32, 8), excessive.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 2), excessive.completion_tokens);
+}
+
+test "estimateResponseCompletionTokens includes reasoning and tool calls" {
+    const calls = [_]providers.ToolCall{.{ .id = "call-1", .name = "shell", .arguments = "{\"cmd\":\"pwd\"}" }};
+    const response = ChatResponse{
+        .tool_calls = &calls,
+        .reasoning_content = "inspect workspace",
+    };
+    try std.testing.expect(estimateResponseCompletionTokens(&response) > 0);
 }
 
 test "Agent trimHistory no-op when under limit" {
@@ -8812,9 +8858,12 @@ test "Agent tool-limit summary records observer events and token metric" {
     try std.testing.expectEqual(@as(usize, 0), observer.llm_failure_count);
     try std.testing.expectEqual(@as(usize, 1), observer.tool_iterations_exhausted_count);
     try std.testing.expectEqual(@as(usize, 1), observer.turn_complete_count);
-    try std.testing.expectEqual(@as(u64, estimate_text_tokens("running tool") + 5), observer.tokens_used_metric_total);
+    const tool_response_tokens = estimate_text_tokens("running tool") + estimate_text_tokens("call-noop") + estimate_text_tokens("noop") + estimate_text_tokens("{}");
+    try std.testing.expectEqual(@as(u64, tool_response_tokens + 5), observer.tokens_used_metric_total);
     try std.testing.expectEqual(@as(?u32, 5), observer.last_llm_response_total_tokens);
-    try std.testing.expectEqual(@as(u64, estimate_text_tokens("running tool") + 5), agent.tokensUsed());
+    try std.testing.expectEqual(@as(u64, tool_response_tokens + 5), agent.tokensUsed());
+    try std.testing.expectEqual(@as(u64, 3), agent.promptTokensUsed());
+    try std.testing.expectEqual(@as(u64, tool_response_tokens + 2), agent.completionTokensUsed());
     try std.testing.expectEqual(@as(u32, 5), agent.last_turn_usage.total_tokens);
 }
 
@@ -8936,7 +8985,8 @@ test "Agent tool-limit summary records llm failure when summary call fails" {
     try std.testing.expectEqual(@as(usize, 1), observer.llm_failure_count);
     try std.testing.expectEqual(@as(usize, 1), observer.tool_iterations_exhausted_count);
     try std.testing.expectEqual(@as(usize, 1), observer.turn_complete_count);
-    try std.testing.expectEqual(@as(u64, estimate_text_tokens("running tool")), observer.tokens_used_metric_total);
+    const tool_response_tokens = estimate_text_tokens("running tool") + estimate_text_tokens("call-noop") + estimate_text_tokens("noop") + estimate_text_tokens("{}");
+    try std.testing.expectEqual(@as(u64, tool_response_tokens), observer.tokens_used_metric_total);
 }
 
 test "bindMemoryTools wires memory tools to sqlite backend" {
