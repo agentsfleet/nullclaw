@@ -861,10 +861,46 @@ pub fn curlStreamAnthropic(
 
     const file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
+    var total_stdout: usize = 0;
 
     outer: while (true) {
         const n = file.read(&read_buf) catch break;
         if (n == 0) break;
+        total_stdout += n;
+
+        // A body that opens with '{' is a JSON error payload, not an SSE
+        // stream. Without this branch every line parses as `.skip`, the loop
+        // drains, and the non-zero exit falls through to `CurlFailed` — which
+        // reads as a transport fault and names neither the model nor the
+        // status. Anthropic answers a model that does not exist with
+        // {"type":"error","error":{"type":"not_found_error","message":...}},
+        // so classify it the way the OpenAI-compatible stream does and keep
+        // the words.
+        if (total_stdout == n and read_buf[0] == '{') {
+            // No dupe: `read_buf` is this frame's own stack buffer and nothing
+            // reads it again before the returns below, so the slice outlives
+            // every use here. Copying it would add an allocation whose failure
+            // path leaks `current_event` and skips the reap.
+            const json_response = read_buf[0..n];
+            if (current_event.len > 0) allocator.free(@constCast(current_event));
+
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch null;
+            if (parsed) |p| {
+                defer p.deinit();
+                if (p.value == .object) {
+                    if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
+                        const mapped_err = error_classify.kindToError(kind);
+                        recordStreamApiErrorDetail(allocator, p.value.object, mapped_err);
+                        _ = child.wait() catch {};
+                        return mapped_err;
+                    }
+                }
+            }
+
+            recordStreamApiErrorBody(allocator, json_response);
+            _ = child.wait() catch {};
+            return error.ServerError;
+        }
 
         for (read_buf[0..n]) |byte| {
             if (byte == '\n') {
@@ -1353,4 +1389,49 @@ test "an unrecognised JSON error payload still leaves the body as evidence" {
     const detail = (try root.snapshotLastApiErrorDetail(allocator)).?;
     defer allocator.free(detail);
     try std.testing.expect(std.mem.indexOf(u8, detail, "upstream connect error") != null);
+}
+
+test "an Anthropic streamed model-not-found payload names the model, not the transport" {
+    // Before: the body parsed as SSE lines that all skipped, the loop drained,
+    // and the non-zero exit surfaced CurlFailed — a transport error name for a
+    // provider rejection, with the message discarded.
+    const allocator = std.testing.allocator;
+    root.clearLastApiErrorDetail();
+    defer root.clearLastApiErrorDetail();
+
+    const body =
+        \\{"type":"error","error":{"type":"not_found_error","message":"model: claude-does-not-exist"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const kind = error_classify.classifyKnownApiError(parsed.value.object).?;
+    const mapped_err = error_classify.kindToError(kind);
+    try std.testing.expectEqual(error.ApiError, mapped_err);
+    recordStreamApiErrorDetail(allocator, parsed.value.object, mapped_err);
+
+    const detail = (try root.snapshotLastApiErrorDetail(allocator)).?;
+    defer allocator.free(detail);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "not_found_error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "claude-does-not-exist") != null);
+}
+
+test "an Anthropic streamed overload payload maps to the rate-limit bucket" {
+    const allocator = std.testing.allocator;
+    root.clearLastApiErrorDetail();
+    defer root.clearLastApiErrorDetail();
+
+    const body =
+        \\{"type":"error","error":{"type":"rate_limit_error","message":"Number of requests has exceeded your rate limit","status":429}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const kind = error_classify.classifyKnownApiError(parsed.value.object).?;
+    try std.testing.expectEqual(error.RateLimited, error_classify.kindToError(kind));
+    recordStreamApiErrorDetail(allocator, parsed.value.object, error_classify.kindToError(kind));
+
+    const detail = (try root.snapshotLastApiErrorDetail(allocator)).?;
+    defer allocator.free(detail);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "429") != null);
 }
