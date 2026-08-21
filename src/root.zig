@@ -6,6 +6,13 @@
 //!   onboard, providers, security, skills, tools
 
 // Shared utilities
+// Re-exported so embedders can hand their `std.process.Init` to the compat
+// layer (`compat.initProcess(init)`), exactly as this repository's own `main`
+// does. Without it, `compat.io()` falls back to `Io.Threaded`'s
+// `init_single_threaded`, whose allocator is `.failing` on Zig 0.16 — every
+// subprocess spawn (the curl provider transport) then dies with a synthetic
+// `error.OutOfMemory` before fork.
+pub const compat = @import("compat");
 pub const json_util = @import("json_util.zig");
 pub const admin_output = @import("admin_output.zig");
 pub const fs_compat = @import("fs_compat.zig");
