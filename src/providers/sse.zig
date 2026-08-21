@@ -320,6 +320,39 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
     return null;
 }
 
+/// Record the provider's own words for a streamed API error so the caller can
+/// report WHY the dial failed.
+///
+/// The blocking parse paths in every provider already do this; the streaming
+/// path classified the payload and dropped the text, so an embedder saw the
+/// bare error name. `ApiError` alone cannot distinguish a model that does not
+/// exist from a rejected credential — `error_classify` collapses both into the
+/// same bucket — which is exactly the difference an operator needs.
+///
+/// Best-effort by construction: it runs while an error is already returning,
+/// so a scrub allocation failure falls back to the unscrubbed summary rather
+/// than replacing the caller's error.
+fn recordStreamApiErrorDetail(
+    allocator: std.mem.Allocator,
+    root_obj: std.json.ObjectMap,
+    mapped_err: anyerror,
+) void {
+    var summary_buf: [1024]u8 = undefined;
+    const summary = error_classify.summarizeKnownApiError(root_obj, &summary_buf) orelse @errorName(mapped_err);
+    const sanitized = root.sanitizeApiError(allocator, summary) catch null;
+    defer if (sanitized) |s| allocator.free(s);
+    root.setLastApiErrorDetail("", sanitized orelse summary);
+}
+
+/// Record an error payload that is JSON but not a shape `error_classify`
+/// recognises. The body is the only evidence there is; scrubbed, it still names
+/// the fault where an unadorned `ServerError` names nothing.
+fn recordStreamApiErrorBody(allocator: std.mem.Allocator, body: []const u8) void {
+    const sanitized = root.sanitizeApiError(allocator, body) catch return;
+    defer allocator.free(sanitized);
+    root.setLastApiErrorDetail("", sanitized);
+}
+
 /// Run curl in SSE streaming mode and parse output line by line.
 ///
 /// Spawns `curl -s --no-buffer` with the strongest supported fail-fast flag:
@@ -499,13 +532,18 @@ pub fn curlStream(
             const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch null;
             if (parsed) |p| {
                 defer p.deinit();
-                if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
-                    _ = child.wait() catch {};
-                    return error_classify.kindToError(kind);
+                if (p.value == .object) {
+                    if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
+                        const mapped_err = error_classify.kindToError(kind);
+                        recordStreamApiErrorDetail(allocator, p.value.object, mapped_err);
+                        _ = child.wait() catch {};
+                        return mapped_err;
+                    }
                 }
             }
 
             // Return a meaningful error
+            recordStreamApiErrorBody(allocator, json_response);
             _ = child.wait() catch {};
             debug_log.err("Server returned JSON error payload: len={d}", .{json_response.len});
             return error.ServerError;
@@ -1256,4 +1294,63 @@ test "extractStreamUsage returns null for null usage field" {
         \\{"id":"chatcmpl-abc","choices":[{"delta":{"content":"Hi"}}],"usage":null}
     ;
     try std.testing.expect(extractStreamUsage(json) == null);
+}
+
+test "a streamed 404 error payload records the provider's own words" {
+    // The regression: a fleet pinned to a model no provider serves streamed its
+    // dial, so the 404 body went through this file — which classified it and
+    // threw the text away. The embedder then reported the bare word `ApiError`,
+    // indistinguishable from a rejected credential.
+    const allocator = std.testing.allocator;
+    root.clearLastApiErrorDetail();
+    defer root.clearLastApiErrorDetail();
+
+    const body =
+        \\{"error":{"object":"error","type":"invalid_request_error","message":"Model not found, inaccessible, and/or not deployed","status":404}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const kind = error_classify.classifyKnownApiError(parsed.value.object).?;
+    const mapped_err = error_classify.kindToError(kind);
+    try std.testing.expectEqual(error.ApiError, mapped_err);
+    recordStreamApiErrorDetail(allocator, parsed.value.object, mapped_err);
+
+    const detail = (try root.snapshotLastApiErrorDetail(allocator)).?;
+    defer allocator.free(detail);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "404") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "Model not found") != null);
+}
+
+test "a streamed rate-limit payload keeps its status alongside the mapped error" {
+    const allocator = std.testing.allocator;
+    root.clearLastApiErrorDetail();
+    defer root.clearLastApiErrorDetail();
+
+    const body =
+        \\{"error":{"message":"Rate limit exceeded","type":"rate_limit_error","status":429}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const kind = error_classify.classifyKnownApiError(parsed.value.object).?;
+    try std.testing.expectEqual(error.RateLimited, error_classify.kindToError(kind));
+    recordStreamApiErrorDetail(allocator, parsed.value.object, error_classify.kindToError(kind));
+
+    const detail = (try root.snapshotLastApiErrorDetail(allocator)).?;
+    defer allocator.free(detail);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "429") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "Rate limit exceeded") != null);
+}
+
+test "an unrecognised JSON error payload still leaves the body as evidence" {
+    const allocator = std.testing.allocator;
+    root.clearLastApiErrorDetail();
+    defer root.clearLastApiErrorDetail();
+
+    recordStreamApiErrorBody(allocator, "{\"detail\":\"upstream connect error\"}");
+
+    const detail = (try root.snapshotLastApiErrorDetail(allocator)).?;
+    defer allocator.free(detail);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "upstream connect error") != null);
 }
