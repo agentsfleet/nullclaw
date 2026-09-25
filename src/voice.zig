@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const json_util = @import("json_util.zig");
 const http_util = @import("http_util.zig");
+const native_http = @import("native_http.zig");
 const net_security = @import("net_security.zig");
 
 const log = std.log.scoped(.voice);
@@ -35,8 +36,6 @@ pub const TranscribeError = error{
 } || std.mem.Allocator.Error;
 
 const TEMP_PATH_ATTEMPTS: usize = 16;
-const TRANSCRIBE_CURL_MAX_TIME_SECS = "120";
-const TRANSCRIBE_CURL_CONNECT_TIMEOUT_SECS = "30";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Transcriber vtable interface
@@ -179,7 +178,7 @@ pub fn transcribeFile(
     ) catch return error.ApiRequestFailed;
     defer allocator.free(auth_hdr);
 
-    // POST via curl using --data-binary @tempfile
+    // POST the multipart body from the temporary file
     const resp = curlPostFromFile(
         allocator,
         endpoint,
@@ -358,75 +357,40 @@ fn parseTranscriptionText(allocator: std.mem.Allocator, json_resp: []const u8) !
     return try allocator.dupe(u8, text_val.string);
 }
 
-/// HTTP POST via curl subprocess, reading body from a file on disk.
-/// Used for multipart/form-data where body has already been written to a temp file.
+/// Send a multipart body from disk without buffering it in process memory.
 fn curlPostFromFile(
     allocator: std.mem.Allocator,
     url: []const u8,
     file_path: [:0]const u8,
     headers: []const []const u8,
 ) ![]u8 {
-    const data_arg = try std.fmt.allocPrint(allocator, "@{s}", .{file_path});
-    defer allocator.free(data_arg);
-
-    var argv_buf: [32][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "--max-time";
-    argc += 1;
-    argv_buf[argc] = TRANSCRIBE_CURL_MAX_TIME_SECS;
-    argc += 1;
-    argv_buf[argc] = "--connect-timeout";
-    argc += 1;
-    argv_buf[argc] = TRANSCRIBE_CURL_CONNECT_TIMEOUT_SECS;
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-
-    var prepared_headers = try http_util.prepareCurlHeaderArg(allocator, headers);
-    defer prepared_headers.deinit(allocator);
-    if (prepared_headers.arg) |headers_arg| {
-        if (argc + 2 > argv_buf.len) return error.CurlFailed;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = headers_arg;
-        argc += 1;
+    const file = try std_compat.fs.openFileAbsolute(file_path, .{});
+    defer file.close();
+    const size = (try file.stat()).size;
+    var upload = file;
+    const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
+    defer if (resolve_entry) |entry| allocator.free(entry);
+    const proxy = try http_util.getProxyForUrl(allocator, url);
+    defer if (proxy) |value| allocator.free(value);
+    var response = try native_http.perform(allocator, .{
+        .method = .post,
+        .url = url,
+        .body_file = &upload,
+        .body_file_size = size,
+        .headers = headers,
+        .proxy = proxy,
+        .resolve_entry = resolve_entry,
+        .timeout_secs = 120,
+        .connect_timeout_secs = 30,
+        .max_body_bytes = 4 * 1024 * 1024,
+        .interrupt_flag = http_util.currentThreadInterruptFlag(),
+    });
+    if (response.transport_error) |err| {
+        response.deinit(allocator);
+        return err;
     }
-
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = data_arg;
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return error.CurlReadError;
-
-    const term = child.wait() catch return error.CurlWaitError;
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
-        else => {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
-    }
-
-    return stdout;
+    allocator.free(response.headers);
+    return response.body;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -672,6 +636,81 @@ test "voice writeMultipartToTempFile refuses to overwrite existing file" {
     const content = try target_file.readToEndAlloc(allocator, 64);
     defer allocator.free(content);
     try std.testing.expectEqualStrings("existing", content);
+}
+
+test "voice file upload sends exact multipart bytes and closes on interruption" {
+    // Regression: the native file source must preserve the multipart body and
+    // release its file handle when a running request is canceled.
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const path = try std.fmt.allocPrint(allocator, "{s}/multipart.bin", .{base});
+    defer allocator.free(path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const body = try buildMultipartBody(allocator, "testboundary", "audio-bytes", .{});
+    defer allocator.free(body);
+    {
+        const file = try std_compat.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(body);
+    }
+
+    const address = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try address.listen(.{});
+    defer server.deinit();
+    const Upload = struct {
+        server: *std_compat.net.Server,
+        expected: []const u8,
+        matched: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(self: *@This()) void {
+            var connection = self.server.accept() catch return;
+            defer connection.stream.close();
+            var request: [8192]u8 = undefined;
+            var used: usize = 0;
+            while (used < request.len) {
+                const count = connection.stream.read(request[used..]) catch return;
+                if (count == 0) return;
+                used += count;
+                const end = std.mem.indexOf(u8, request[0..used], "\r\n\r\n") orelse continue;
+                const body_start = end + 4;
+                if (used < body_start + self.expected.len) continue;
+                const head = request[0..body_start];
+                const received = request[body_start .. body_start + self.expected.len];
+                self.matched.store(std.mem.startsWith(u8, head, "POST /upload ") and
+                    std.mem.indexOf(u8, head, "Content-Type: multipart/form-data; boundary=testboundary") != null and
+                    std.mem.eql(u8, received, self.expected), .release);
+                connection.stream.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok") catch {};
+                return;
+            }
+        }
+    };
+    var upload = Upload{ .server = &server, .expected = body };
+    var thread = try std.Thread.spawn(.{}, Upload.run, .{&upload});
+    var joined = false;
+    defer if (!joined) {
+        var connection = std_compat.net.tcpConnectToAddress(server.listen_address) catch null;
+        if (connection) |*stream| stream.close();
+        thread.join();
+    };
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/upload", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+    const response = try curlPostFromFile(allocator, url, path_z, &.{"Content-Type: multipart/form-data; boundary=testboundary"});
+    defer allocator.free(response);
+    thread.join();
+    joined = true;
+    try std.testing.expectEqualStrings("ok", response);
+    try std.testing.expect(upload.matched.load(.acquire));
+
+    var interrupted = std.atomic.Value(bool).init(true);
+    http_util.setThreadInterruptFlag(&interrupted);
+    defer http_util.setThreadInterruptFlag(null);
+    try std.testing.expectError(error.CurlInterrupted, curlPostFromFile(allocator, url, path_z, &.{}));
+    try std_compat.fs.deleteFileAbsolute(path);
 }
 
 test "voice parseTranscriptionText valid" {

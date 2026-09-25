@@ -52,6 +52,207 @@ const ToolExecutionResult = dispatcher.ToolExecutionResult;
 const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 25;
 const MAX_MID_TURN_INJECTION_FOLLOWUPS: u32 = 8;
 
+/// The embedded fleet runner forwards only provider-typed text from native
+/// tool passes. Prompt-tool passes are classified after the full response;
+/// exposing their intermediate bytes could show tool arguments or results.
+const SafeStreamGate = struct {
+    target: providers.StreamCallback,
+    ctx: *anyopaque,
+    native_tools_enabled: bool,
+    blocked: bool = false,
+    answer_started: bool = false,
+    pending: [16]u8 = undefined,
+    pending_len: usize = 0,
+    pending_kind: providers.StreamChunkKind = .untrusted,
+
+    const markers = [_][]const u8{
+        "<tool_", "</tool_", "<|tool_", "</|tool_",
+        "[tool_", "[/tool_", "<think",  "</think",
+    };
+
+    fn markerPrefix(candidate: []const u8) bool {
+        for (markers) |marker| {
+            if (candidate.len <= marker.len and std.ascii.eqlIgnoreCase(candidate, marker[0..candidate.len])) return true;
+        }
+        return false;
+    }
+
+    fn markerComplete(candidate: []const u8) bool {
+        for (markers) |marker| {
+            if (candidate.len == marker.len and std.ascii.eqlIgnoreCase(candidate, marker)) return true;
+        }
+        return false;
+    }
+
+    fn hasUnsafeTextProtocol(text: []const u8) bool {
+        if (dispatcher.isNativeJsonFormat(text)) return true;
+        for (text, 0..) |byte, at| {
+            if (byte != '<' and byte != '[') continue;
+            for (markers) |marker| {
+                if (text.len - at >= marker.len and std.ascii.eqlIgnoreCase(text[at..][0..marker.len], marker)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn emit(self: *SafeStreamGate, source: providers.StreamChunk, text: []const u8, kind: providers.StreamChunkKind) void {
+        if (text.len == 0) return;
+        var part = source;
+        part.delta = text;
+        part.kind = kind;
+        self.target(self.ctx, part);
+    }
+
+    fn releaseNonMarker(self: *SafeStreamGate, source: providers.StreamChunk) void {
+        const pending = self.pending[0..self.pending_len];
+        if (markerComplete(pending)) {
+            self.blocked = true;
+            return;
+        }
+        if (markerPrefix(pending)) return;
+        var keep: usize = self.pending_len;
+        while (keep > 0) {
+            keep -= 1;
+            if (markerPrefix(pending[self.pending_len - keep ..])) break;
+        }
+        const released = self.pending_len - keep;
+        self.emit(source, pending[0..released], self.pending_kind);
+        std.mem.copyForwards(u8, self.pending[0..keep], pending[released..]);
+        self.pending_len = keep;
+        if (keep > 0 and markerComplete(self.pending[0..keep])) self.blocked = true;
+    }
+
+    fn forward(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+        const self: *SafeStreamGate = @ptrCast(@alignCast(ctx));
+        if (!self.native_tools_enabled or self.blocked or chunk.kind == .untrusted or chunk.is_final) return;
+        var at: usize = 0;
+        while (at < chunk.delta.len and !self.blocked) {
+            if (chunk.kind == .answer and !self.answer_started) {
+                const byte = chunk.delta[at];
+                if (!std.ascii.isWhitespace(byte)) {
+                    self.answer_started = true;
+                    if (byte == '{') {
+                        // A text-form native JSON tool call cannot be classified
+                        // until the full provider pass is available.
+                        self.blocked = true;
+                        return;
+                    }
+                }
+            }
+            if (self.pending_len == 0) {
+                const start = at;
+                while (at < chunk.delta.len and chunk.delta[at] != '<' and chunk.delta[at] != '[') : (at += 1) {
+                    const byte = chunk.delta[at];
+                    if (chunk.kind == .answer and !self.answer_started and !std.ascii.isWhitespace(byte)) {
+                        self.answer_started = true;
+                        if (byte == '{') {
+                            self.emit(chunk, chunk.delta[start..at], chunk.kind);
+                            self.blocked = true;
+                            return;
+                        }
+                    }
+                }
+                self.emit(chunk, chunk.delta[start..at], chunk.kind);
+                if (at == chunk.delta.len) break;
+                self.pending[0] = chunk.delta[at];
+                self.pending_len = 1;
+                self.pending_kind = chunk.kind;
+                at += 1;
+                continue;
+            }
+            if (self.pending_kind != chunk.kind) {
+                self.blocked = true;
+                return;
+            }
+            self.pending[self.pending_len] = chunk.delta[at];
+            self.pending_len += 1;
+            at += 1;
+            self.releaseNonMarker(chunk);
+        }
+    }
+};
+
+test "embedded stream gate forwards typed native text and withholds prompt-tool bytes" {
+    const Sink = struct {
+        answer: usize = 0,
+        reasoning: usize = 0,
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (chunk.kind) {
+                .answer => self.answer += chunk.delta.len,
+                .reasoning => self.reasoning += chunk.delta.len,
+                .untrusted => unreachable,
+            }
+        }
+    };
+    var sink = Sink{};
+    var native = SafeStreamGate{ .target = Sink.onChunk, .ctx = &sink, .native_tools_enabled = true };
+    SafeStreamGate.forward(&native, providers.StreamChunk.answerDelta("answer"));
+    SafeStreamGate.forward(&native, providers.StreamChunk.reasoningDelta("think"));
+    SafeStreamGate.forward(&native, providers.StreamChunk.textDelta("<tool_result>secret"));
+    SafeStreamGate.forward(&native, providers.StreamChunk.finalChunk());
+    try std.testing.expectEqual(@as(usize, 6), sink.answer);
+    try std.testing.expectEqual(@as(usize, 5), sink.reasoning);
+    var prompt_tools = SafeStreamGate{ .target = Sink.onChunk, .ctx = &sink, .native_tools_enabled = false };
+    SafeStreamGate.forward(&prompt_tools, providers.StreamChunk.answerDelta("hidden"));
+    try std.testing.expectEqual(@as(usize, 6), sink.answer);
+}
+
+test "embedded stream gate preserves code markup and withholds split tool syntax" {
+    const Sink = struct {
+        bytes: [256]u8 = undefined,
+        len: usize = 0,
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.debug.assert(self.len + chunk.delta.len <= self.bytes.len);
+            @memcpy(self.bytes[self.len..][0..chunk.delta.len], chunk.delta);
+            self.len += chunk.delta.len;
+        }
+        fn text(self: *const @This()) []const u8 {
+            return self.bytes[0..self.len];
+        }
+    };
+
+    var safe_sink = Sink{};
+    var safe = SafeStreamGate{ .target = Sink.onChunk, .ctx = &safe_sink, .native_tools_enabled = true };
+    SafeStreamGate.forward(&safe, providers.StreamChunk.answerDelta("Use <di"));
+    SafeStreamGate.forward(&safe, providers.StreamChunk.answerDelta("v> and Vec<String>"));
+    try std.testing.expectEqualStrings("Use <div> and Vec<String>", safe_sink.text());
+
+    var tool_sink = Sink{};
+    var tool = SafeStreamGate{ .target = Sink.onChunk, .ctx = &tool_sink, .native_tools_enabled = true };
+    SafeStreamGate.forward(&tool, providers.StreamChunk.answerDelta("safe <to"));
+    SafeStreamGate.forward(&tool, providers.StreamChunk.answerDelta("ol_call>{\"arguments\":\"secret\"}"));
+    SafeStreamGate.forward(&tool, providers.StreamChunk.answerDelta(" later"));
+    try std.testing.expectEqualStrings("safe ", tool_sink.text());
+    try std.testing.expect(tool.blocked);
+
+    var bracket_sink = Sink{};
+    var bracket = SafeStreamGate{ .target = Sink.onChunk, .ctx = &bracket_sink, .native_tools_enabled = true };
+    SafeStreamGate.forward(&bracket, providers.StreamChunk.reasoningDelta("think [TO"));
+    SafeStreamGate.forward(&bracket, providers.StreamChunk.reasoningDelta("OL_CALL]secret"));
+    try std.testing.expectEqualStrings("think ", bracket_sink.text());
+    try std.testing.expect(bracket.blocked);
+
+    var json_sink = Sink{};
+    var json = SafeStreamGate{ .target = Sink.onChunk, .ctx = &json_sink, .native_tools_enabled = true };
+    SafeStreamGate.forward(&json, providers.StreamChunk.answerDelta("  "));
+    SafeStreamGate.forward(&json, providers.StreamChunk.answerDelta("{\"tool_calls\":[{\"arguments\":\"secret\"}]}"));
+    try std.testing.expectEqualStrings("  ", json_sink.text());
+    try std.testing.expect(json.blocked);
+
+    var mixed_sink = Sink{};
+    var mixed = SafeStreamGate{ .target = Sink.onChunk, .ctx = &mixed_sink, .native_tools_enabled = true };
+    SafeStreamGate.forward(&mixed, providers.StreamChunk.answerDelta("safe <to"));
+    SafeStreamGate.forward(&mixed, providers.StreamChunk.reasoningDelta("ol_call>secret"));
+    try std.testing.expectEqualStrings("safe ", mixed_sink.text());
+    try std.testing.expect(mixed.blocked);
+
+    try std.testing.expect(SafeStreamGate.hasUnsafeTextProtocol("<tool_result>secret"));
+    try std.testing.expect(SafeStreamGate.hasUnsafeTextProtocol(" {\"tool_calls\":[]}"));
+    try std.testing.expect(!SafeStreamGate.hasUnsafeTextProtocol("Use <div> and Vec<String>"));
+}
+
 /// Maximum non-system messages before trimming.
 const DEFAULT_MAX_HISTORY: u32 = 50;
 
@@ -403,6 +604,9 @@ pub const Agent = struct {
     stream_callback: ?providers.StreamCallback = null,
     /// Context pointer passed to stream_callback.
     stream_ctx: ?*anyopaque = null,
+    /// Only provider-typed answer/reasoning bytes may reach the callback.
+    /// The host still gets the authoritative final text from `turn()`.
+    safe_stream_only: bool = false,
     /// Optional progress hint callback. When set, called on tool_call_start events.
     progress_callback: ?ProgressCallback = null,
     /// Context pointer passed to progress_callback.
@@ -2060,7 +2264,7 @@ pub const Agent = struct {
             defer prompt_tools_arena.deinit();
             const prompt_tools = try self.filterToolsForPromptText(prompt_tools_arena.allocator());
             const prompt_is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
-            const prompt_native_tools_enabled = !prompt_is_streaming and self.provider.supportsNativeTools();
+            const prompt_native_tools_enabled = self.provider.supportsToolsForModel(turn_model_name, prompt_is_streaming);
 
             const capabilities_section = capabilities_mod.buildPromptSection(
                 self.allocator,
@@ -2238,7 +2442,7 @@ pub const Agent = struct {
 
             const timer_start = std_compat.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
-            const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
+            const native_tools_enabled = self.provider.supportsToolsForModel(turn_model_name, is_streaming);
             const include_reasoning = self.reasoning_mode != .off;
 
             // Filter tool specs for this turn (arena-owned; may be self.tool_specs directly if no groups).
@@ -2254,11 +2458,18 @@ pub const Agent = struct {
                 turn_max_tokens,
             );
 
-            // Call provider: streaming (no retries, no native tools) or blocking with retry
+            // Call provider: streaming (no retries) or blocking with retry.
             var response: ChatResponse = undefined;
             var response_attempt: u32 = 1;
             providers.clearLastApiErrorDetail();
             if (is_streaming) {
+                var safe_gate = SafeStreamGate{
+                    .target = self.stream_callback.?,
+                    .ctx = self.stream_ctx.?,
+                    .native_tools_enabled = native_tools_enabled,
+                };
+                const stream_callback = if (self.safe_stream_only) SafeStreamGate.forward else self.stream_callback.?;
+                const stream_ctx = if (self.safe_stream_only) @as(*anyopaque, @ptrCast(&safe_gate)) else self.stream_ctx.?;
                 self.recordLlmRequestEvent(turn_model_name, messages);
                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
                 const stream_result = self.provider.streamChat(
@@ -2269,15 +2480,15 @@ pub const Agent = struct {
                         .model = turn_model_name,
                         .temperature = self.temperature,
                         .max_tokens = request_max_tokens,
-                        .tools = null,
+                        .tools = if (native_tools_enabled) turn_tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                         .include_reasoning = include_reasoning,
                     },
                     turn_model_name,
                     self.temperature,
-                    self.stream_callback.?,
-                    self.stream_ctx.?,
+                    stream_callback,
+                    stream_ctx,
                 ) catch |err| retry_stream: {
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
                     self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
@@ -2306,15 +2517,15 @@ pub const Agent = struct {
                                 .model = turn_model_name,
                                 .temperature = self.temperature,
                                 .max_tokens = retry_max_tokens,
-                                .tools = null,
+                                .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
                                 .include_reasoning = include_reasoning,
                             },
                             turn_model_name,
                             self.temperature,
-                            self.stream_callback.?,
-                            self.stream_ctx.?,
+                            stream_callback,
+                            stream_ctx,
                         ) catch |retry_err| {
                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
                             self.emitUsageFailure(turn_model_name);
@@ -2329,7 +2540,7 @@ pub const Agent = struct {
                 response = ChatResponse{
                     .content = stream_result.content,
                     .reasoning_content = stream_result.reasoning_content,
-                    .tool_calls = &.{},
+                    .tool_calls = stream_result.tool_calls,
                     .usage = stream_result.usage,
                     .model = stream_result.model,
                 };
@@ -2547,12 +2758,13 @@ pub const Agent = struct {
                 if (free_assistant_history and assistant_history_content.len > 0) self.allocator.free(assistant_history_content);
             }
 
+            const safe_native_pass = self.safe_stream_only and native_tools_enabled;
             if (use_native) {
                 // Provider returned structured tool_calls — convert them
                 parsed_calls = try dispatcher.parseStructuredToolCalls(self.allocator, response.tool_calls);
                 free_parsed_calls = true;
 
-                if (parsed_calls.len == 0) {
+                if (parsed_calls.len == 0 and !safe_native_pass) {
                     // Structured calls were empty (e.g. all had empty names) — try XML fallback
                     self.allocator.free(parsed_calls);
                     free_parsed_calls = false;
@@ -2571,6 +2783,11 @@ pub const Agent = struct {
                     parsed_calls,
                 );
                 free_assistant_history = true;
+            } else if (safe_native_pass) {
+                // A native-tools provider must return structured tool calls.
+                // Textual fallback could reinterpret bytes already shown live.
+                assistant_history_content = try dispatcher.stripToolResultMarkup(self.allocator, response_text);
+                free_assistant_history = true;
             } else {
                 // No native tool calls — parse response text for XML tool calls
                 const xml_parsed = try dispatcher.parseToolCalls(self.allocator, response_text);
@@ -2587,7 +2804,10 @@ pub const Agent = struct {
             // When tool calls are present, only show parsed plain text (if any).
             // Never fall back to raw response_text here, otherwise markup like
             // <tool_call>...</tool_call> can leak to users.
-            const display_text = selectDisplayText(response_text, parsed_text, parsed_calls.len);
+            const display_text = if (safe_native_pass and SafeStreamGate.hasUnsafeTextProtocol(response_text))
+                ""
+            else
+                selectDisplayText(response_text, parsed_text, parsed_calls.len);
 
             if (parsed_calls.len == 0) {
                 const trimmed_display_text = std.mem.trim(u8, display_text, " \t\r\n");
@@ -11002,6 +11222,228 @@ test "Agent system prompt keeps parameters when streaming disables native tool s
     try std.testing.expect(std.mem.indexOf(u8, captured, "**shell**: shell") != null);
     try std.testing.expect(std.mem.indexOf(u8, captured, "Parameters: `{}`") != null);
     try std.testing.expect(std.mem.indexOf(u8, captured, "mcp_secret_lookup") == null);
+}
+
+test "Agent executes a native tool call returned by a streaming provider" {
+    const ProbeTool = struct {
+        const Self = @This();
+        count: *usize,
+        pub const tool_name = "probe";
+        pub const tool_description = "probe";
+        pub const tool_params =
+            \\{"type":"object","properties":{}}
+        ;
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.count.* += 1;
+            return .{ .success = true, .output = "probe ok" };
+        }
+    };
+
+    const StreamingToolProvider = struct {
+        count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ShouldNotUseBlockingChat;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: providers.ChatRequest,
+            model: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const specs = request.tools orelse return error.MissingStreamToolSchemas;
+            try std.testing.expectEqual(@as(usize, 1), specs.len);
+            try std.testing.expectEqualStrings("probe", specs[0].name);
+            self.count += 1;
+            if (self.count == 1) {
+                const calls = try allocator.alloc(providers.ToolCall, 1);
+                errdefer allocator.free(calls);
+                calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-probe-1"),
+                    .name = try allocator.dupe(u8, "probe"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                callback(callback_ctx, providers.StreamChunk.finalChunk());
+                return .{ .tool_calls = calls, .model = try allocator.dupe(u8, model) };
+            }
+            var saw_tool_result = false;
+            for (request.messages) |message| {
+                if (message.role == .user and std.mem.indexOf(u8, message.content, "probe ok") != null) saw_tool_result = true;
+            }
+            try std.testing.expect(saw_tool_result);
+            callback(callback_ctx, providers.StreamChunk.textDelta("done"));
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{ .content = try allocator.dupe(u8, "done"), .model = try allocator.dupe(u8, model) };
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "streaming-tool-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = StreamingToolProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = StreamingToolProvider.chatWithSystem,
+        .chat = StreamingToolProvider.chat,
+        .supportsNativeTools = StreamingToolProvider.supportsNativeTools,
+        .getName = StreamingToolProvider.getName,
+        .deinit = StreamingToolProvider.deinitFn,
+        .supports_streaming = StreamingToolProvider.supportsStreaming,
+        .supportsStreamingTools = StreamingToolProvider.supportsStreaming,
+        .stream_chat = StreamingToolProvider.streamChat,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+    var probe_count: usize = 0;
+    var probe_tool = ProbeTool{ .count = &probe_count };
+    const runtime_tools = [_]Tool{probe_tool.tool()};
+    const specs = try allocator.alloc(ToolSpec, 1);
+    specs[0] = .{
+        .name = runtime_tools[0].name(),
+        .description = runtime_tools[0].description(),
+        .parameters_json = runtime_tools[0].parametersJson(),
+    };
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &runtime_tools,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 5,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+    const StreamSink = struct {
+        fn onChunk(_: *anyopaque, _: providers.StreamChunk) void {}
+    };
+    var stream_ctx: u8 = 0;
+    agent.stream_callback = StreamSink.onChunk;
+    agent.stream_ctx = @ptrCast(&stream_ctx);
+
+    const answer = try agent.turn("run probe");
+    defer allocator.free(answer);
+    try std.testing.expectEqualStrings("done", answer);
+    try std.testing.expectEqual(@as(usize, 1), probe_count);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.count);
+}
+
+test "fleet native stream does not execute or publish textual tool fallback" {
+    const ProviderState = struct {
+        calls: usize = 0,
+        saw_retry_instruction: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ShouldUseStreamChat;
+        }
+        fn supports(_: *anyopaque) bool {
+            return true;
+        }
+        fn streamChat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, model: []const u8, _: f64, callback: providers.StreamCallback, ctx: *anyopaque) anyerror!providers.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) {
+                callback(ctx, providers.StreamChunk.answerDelta("safe <to"));
+                callback(ctx, providers.StreamChunk.answerDelta("ol_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"secret\"}}</tool_call>"));
+                return .{
+                    .content = try allocator.dupe(u8, "safe <tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"secret\"}}</tool_call>"),
+                    .model = try allocator.dupe(u8, model),
+                };
+            }
+            for (request.messages) |message| {
+                if (message.role == .user and std.mem.indexOf(u8, message.content, "Your previous reply was empty") != null) self.saw_retry_instruction = true;
+            }
+            callback(ctx, providers.StreamChunk.answerDelta("recovered"));
+            return .{ .content = try allocator.dupe(u8, "recovered"), .model = try allocator.dupe(u8, model) };
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "textual-tool-fallback-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+    const Sink = struct {
+        bytes: std.ArrayListUnmanaged(u8) = .empty,
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.bytes.appendSlice(std.testing.allocator, chunk.delta) catch unreachable;
+        }
+    };
+    const allocator = std.testing.allocator;
+    var state = ProviderState{};
+    const vtable = Provider.VTable{
+        .chatWithSystem = ProviderState.chatWithSystem,
+        .chat = ProviderState.chat,
+        .supportsNativeTools = ProviderState.supports,
+        .supports_streaming = ProviderState.supports,
+        .supportsStreamingTools = ProviderState.supports,
+        .stream_chat = ProviderState.streamChat,
+        .getName = ProviderState.getName,
+        .deinit = ProviderState.deinitFn,
+    };
+    var noop = observability.NoopObserver{};
+    var sink = Sink{};
+    defer sink.bytes.deinit(allocator);
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&state), .vtable = &vtable },
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .safe_stream_only = true,
+        .stream_callback = Sink.onChunk,
+        .stream_ctx = @ptrCast(&sink),
+    };
+    defer agent.deinit();
+    const answer = try agent.turn("reply without a tool");
+    defer allocator.free(answer);
+    try std.testing.expectEqualStrings("recovered", answer);
+    try std.testing.expectEqualStrings("safe recovered", sink.bytes.items);
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+    try std.testing.expect(state.saw_retry_instruction);
 }
 
 test "buildProviderMessagesForTurn adds priority hint without mutating history" {

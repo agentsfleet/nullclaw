@@ -18,6 +18,22 @@ const log = std.log.scoped(.compatible);
 /// Runtime code uses OpenAiCompatibleProvider.max_streaming_prompt_bytes (null = no limit).
 const DEFAULT_MAX_STREAMING_PROMPT_BYTES: usize = 32 * 1024;
 const STREAMING_FALLBACK_TIMEOUT_SECS: u64 = 90;
+const STREAM_NO_FINAL_FORMAT = "finish_reason={s} reasoning_bytes={d} tool_fragments={d}";
+const MAX_STREAM_NO_FINAL_BYTES = std.fmt.comptimePrint(
+    STREAM_NO_FINAL_FORMAT,
+    .{ "content_filter", std.math.maxInt(usize), std.math.maxInt(u32) },
+).len;
+
+fn recordEmptyStream(provider_name: []const u8, result: root.StreamChatResult) void {
+    var detail_buf: [MAX_STREAM_NO_FINAL_BYTES]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, STREAM_NO_FINAL_FORMAT, .{
+        @tagName(result.finish_reason),
+        if (result.reasoning_content) |reasoning| reasoning.len else @as(usize, 0),
+        result.tool_fragments,
+    }) catch unreachable;
+    root.setLastApiErrorDetail(provider_name, detail);
+    log.warn("stream_no_final_answer provider={s} {s}", .{ provider_name, detail });
+}
 
 fn logCompatibleApiError(
     allocator: std.mem.Allocator,
@@ -1144,6 +1160,7 @@ pub const OpenAiCompatibleProvider = struct {
         .deinit = deinitImpl,
         .stream_chat = streamChatImpl,
         .supports_streaming = supportsStreamingImpl,
+        .supportsStreamingTools = supportsStreamingToolsImpl,
     };
 
     fn buildSingleTurnMessages(
@@ -1271,13 +1288,23 @@ pub const OpenAiCompatibleProvider = struct {
             }
             return err;
         };
+        errdefer {
+            if (result.content) |content| allocator.free(content);
+            if (result.reasoning_content) |reasoning| allocator.free(reasoning);
+            for (result.tool_calls) |call| {
+                allocator.free(call.id);
+                allocator.free(call.name);
+                allocator.free(call.arguments);
+            }
+            if (result.tool_calls.len > 0) allocator.free(result.tool_calls);
+        }
 
         if (result.content) |raw| {
             const cleaned = try stripThinkBlocks(allocator, raw);
             allocator.free(raw);
             if (cleaned.len == 0) {
+                allocator.free(cleaned);
                 result.content = null;
-                result.usage.completion_tokens = 0;
             } else {
                 result.content = cleaned;
                 // Only fall back to byte-count estimate when the API did not
@@ -1294,6 +1321,9 @@ pub const OpenAiCompatibleProvider = struct {
         {
             result.usage.total_tokens = result.usage.prompt_tokens +| result.usage.completion_tokens;
         }
+        if (result.content == null and result.tool_calls.len == 0) {
+            recordEmptyStream(self.name, result);
+        }
 
         return result;
     }
@@ -1301,6 +1331,11 @@ pub const OpenAiCompatibleProvider = struct {
     fn supportsStreamingImpl(ptr: *anyopaque) bool {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         return !self.disable_streaming and self.api_mode != .responses;
+    }
+
+    fn supportsStreamingToolsImpl(ptr: *anyopaque) bool {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        return self.native_tools and !self.disable_streaming and self.api_mode == .chat_completions;
     }
 
     fn chatWithSystemImpl(
@@ -3287,4 +3322,21 @@ test "shouldSkipStreaming: multi-message total triggers skip when sum exceeds li
     // Individual messages are each under the limit; verify the sum is what matters.
     const single = root.ChatRequest{ .messages = &[_]root.ChatMessage{m1}, .model = "m" };
     try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(25, single));
+}
+
+test "empty stream records safe metadata for the caller's failure report" {
+    root.clearLastApiErrorDetail();
+    defer root.clearLastApiErrorDetail();
+    recordEmptyStream("fireworks", .{
+        .reasoning_content = "private reasoning",
+        .finish_reason = .stop,
+        .tool_fragments = 2,
+    });
+    const detail = (try root.snapshotLastApiErrorDetail(std.testing.allocator)).?;
+    defer std.testing.allocator.free(detail);
+    try std.testing.expectEqualStrings(
+        "fireworks: finish_reason=stop reasoning_bytes=17 tool_fragments=2",
+        detail,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, detail, "private reasoning") == null);
 }

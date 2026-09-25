@@ -1,12 +1,12 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const std_compat = @import("compat");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const net_security = @import("../root.zig").net_security;
 const http_util = @import("../http_util.zig");
+const native_http = @import("../native_http.zig");
 
 const log = std.log.scoped(.http_request);
 
@@ -78,15 +78,15 @@ pub const HttpRequestTool = struct {
         // Non-allowlisted hosts require global address validation.
         //
         // Security trade-off for allowlisted hosts:
-        // - resolveConnectHost normally pins DNS results to curl via --resolve,
+        // - resolveConnectHost normally pins DNS results through libcurl,
         //   preventing DNS rebinding attacks between resolution and connection.
-        // - For allowlisted hosts, we skip this and let curl resolve the hostname.
+        // - For allowlisted hosts, we skip this and let libcurl resolve the hostname.
         //   This is acceptable because the operator explicitly trusts these domains
         //   (e.g., internal services like searxng on private IPs).
         // - DNS rebinding protection is intentionally traded for operational flexibility.
         const connect_host: []const u8 = if (is_allowlisted)
             // Allowlisted: trust the operator, skip SSRF check and DNS pinning.
-            // curl will resolve the hostname itself (no --resolve pinning).
+            // libcurl will resolve the hostname itself (no address pinning).
             try allocator.dupe(u8, host)
         else
             // No allowlist configured: enforce SSRF for all external hosts.
@@ -100,7 +100,7 @@ pub const HttpRequestTool = struct {
         // Parse custom headers from ObjectMap
         const headers_val = root.getValue(args, "headers");
         var header_list: std.ArrayList([2][]const u8) = .empty;
-        errdefer {
+        defer {
             for (header_list.items) |h| {
                 allocator.free(h[0]);
                 allocator.free(h[1]);
@@ -115,31 +115,28 @@ pub const HttpRequestTool = struct {
                         .string => |s| s,
                         else => continue,
                     };
-                    try header_list.append(allocator, .{
-                        try allocator.dupe(u8, entry.key_ptr.*),
-                        try allocator.dupe(u8, val_str),
-                    });
+                    const name = try allocator.dupe(u8, entry.key_ptr.*);
+                    const value = allocator.dupe(u8, val_str) catch |err| {
+                        allocator.free(name);
+                        return err;
+                    };
+                    header_list.append(allocator, .{ name, value }) catch |err| {
+                        allocator.free(name);
+                        allocator.free(value);
+                        return err;
+                    };
                 }
             }
         }
         const custom_headers = header_list.items;
-        defer {
-            for (custom_headers) |h| {
-                allocator.free(h[0]);
-                allocator.free(h[1]);
-            }
-            header_list.deinit(allocator);
-        }
 
         const body: ?[]const u8 = root.getString(args, "body");
 
         if (builtin.is_test) {
             return ToolResult.fail("Network disabled in tests");
         }
-        var curl_stderr: ?[]u8 = null;
-        defer if (curl_stderr) |s| allocator.free(s);
 
-        const status_result = runCurlRequestWithStatus(
+        const status_result = runNativeRequestWithStatus(
             allocator,
             methodToSlice(method),
             url,
@@ -149,16 +146,12 @@ pub const HttpRequestTool = struct {
             custom_headers,
             body,
             self.timeout_secs,
-            &curl_stderr,
             @intCast(self.max_response_size),
         ) catch |err| {
             if (err == error.CurlInterrupted) {
                 return ToolResult.fail("Interrupted by /stop");
             }
-            const msg = if (curl_stderr) |stderr_msg|
-                try std.fmt.allocPrint(allocator, "HTTP request failed: {}\ncurl stderr: {s}", .{ err, stderr_msg })
-            else
-                try std.fmt.allocPrint(allocator, "HTTP request failed: {}", .{err});
+            const msg = try std.fmt.allocPrint(allocator, "HTTP request failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
         defer allocator.free(status_result.body);
@@ -205,31 +198,7 @@ fn methodToSlice(method: std.http.Method) []const u8 {
     };
 }
 
-fn shouldUseCurlResolve(host: []const u8) bool {
-    return std.mem.indexOfScalar(u8, net_security.stripHostBrackets(host), ':') == null;
-}
-
-fn shouldUsePinnedResolve(host: []const u8, connect_host: []const u8) bool {
-    return shouldUseCurlResolve(host) and !std.mem.eql(u8, host, connect_host);
-}
-
-fn buildCurlResolveEntry(
-    allocator: std.mem.Allocator,
-    host: []const u8,
-    port: u16,
-    connect_host: []const u8,
-) ![]u8 {
-    const host_for_resolve = net_security.stripHostBrackets(host);
-    const connect_target = if (std.mem.indexOfScalar(u8, connect_host, ':') != null)
-        try std.fmt.allocPrint(allocator, "[{s}]", .{connect_host})
-    else
-        try allocator.dupe(u8, connect_host);
-    defer allocator.free(connect_target);
-
-    return std.fmt.allocPrint(allocator, "{s}:{d}:{s}", .{ host_for_resolve, port, connect_target });
-}
-
-fn runCurlRequestWithStatus(
+fn runNativeRequestWithStatus(
     allocator: std.mem.Allocator,
     method: []const u8,
     url: []const u8,
@@ -239,203 +208,41 @@ fn runCurlRequestWithStatus(
     headers: []const [2][]const u8,
     body: ?[]const u8,
     timeout_secs: u64,
-    stderr_out: ?*?[]u8,
     max_response_size: usize,
 ) !http_util.HttpResponse {
-    if (stderr_out) |out| out.* = null;
-
-    var argv_buf: [64][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-sS";
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = method;
-    argc += 1;
-    argv_buf[argc] = "--max-time";
-    argc += 1;
-    var timeout_buf: [20]u8 = undefined;
-    const timeout_str = try std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs});
-    argv_buf[argc] = timeout_str;
-    argc += 1;
-
+    const native_method: native_http.Method = if (std.mem.eql(u8, method, "GET")) .get else if (std.mem.eql(u8, method, "POST")) .post else if (std.mem.eql(u8, method, "PUT")) .put else if (std.mem.eql(u8, method, "PATCH")) .patch else if (std.mem.eql(u8, method, "DELETE")) .delete else if (std.mem.eql(u8, method, "HEAD")) .head else if (std.mem.eql(u8, method, "OPTIONS")) .options else return error.UnsupportedMethod;
     var resolve_entry: ?[]u8 = null;
     defer if (resolve_entry) |entry| allocator.free(entry);
-    if (shouldUsePinnedResolve(host, connect_host)) {
-        resolve_entry = try buildCurlResolveEntry(allocator, host, resolved_port, connect_host);
-        argv_buf[argc] = "--resolve";
-        argc += 1;
-        argv_buf[argc] = resolve_entry.?;
-        argc += 1;
+    if (http_util.shouldUsePinnedResolve(host, connect_host))
+        resolve_entry = try http_util.buildCurlResolveEntry(allocator, host, resolved_port, connect_host);
+
+    if (headers.len > 32) return error.TooManyHeaders;
+    var header_lines: [32][]u8 = undefined;
+    var header_count: usize = 0;
+    defer for (header_lines[0..header_count]) |line| allocator.free(line);
+    for (headers) |header| {
+        header_lines[header_count] = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ header[0], header[1] });
+        header_count += 1;
     }
-
-    var header_lines: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (header_lines.items) |line| allocator.free(line);
-        header_lines.deinit(allocator);
+    const proxy = try http_util.getProxyForUrl(allocator, url);
+    defer if (proxy) |value| allocator.free(value);
+    var response = try native_http.perform(allocator, .{
+        .method = native_method,
+        .url = url,
+        .body = body,
+        .headers = header_lines[0..header_count],
+        .proxy = proxy,
+        .resolve_entry = resolve_entry,
+        .timeout_secs = timeout_secs,
+        .max_body_bytes = max_response_size,
+        .interrupt_flag = http_util.currentThreadInterruptFlag(),
+    });
+    if (response.transport_error) |err| {
+        response.deinit(allocator);
+        return err;
     }
-
-    for (headers) |h| {
-        const line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ h[0], h[1] });
-        try header_lines.append(allocator, line);
-    }
-
-    var prepared_headers = try http_util.prepareCurlHeaderArg(allocator, header_lines.items);
-    defer prepared_headers.deinit(allocator);
-    if (prepared_headers.arg) |headers_arg| {
-        if (argc + 2 > argv_buf.len) return error.CurlArgsOverflow;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = headers_arg;
-        argc += 1;
-    }
-
-    if (body != null) {
-        if (argc + 2 + 3 > argv_buf.len) return error.CurlArgsOverflow;
-        argv_buf[argc] = "--data-binary";
-        argc += 1;
-        argv_buf[argc] = "@-";
-        argc += 1;
-    }
-
-    if (argc + 3 > argv_buf.len) return error.CurlArgsOverflow;
-    argv_buf[argc] = "-w";
-    argc += 1;
-    argv_buf[argc] = "\n%{http_code}";
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdin_behavior = if (body != null) .Pipe else .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-
-    const cancel_flag = http_util.currentThreadInterruptFlag();
-    const AtomicBool = std.atomic.Value(bool);
-    const CancelCtx = struct {
-        child: *std_compat.process.Child,
-        cancel_flag: *const AtomicBool,
-        done: *AtomicBool,
-    };
-    const watcherFn = struct {
-        fn run(ctx: *CancelCtx) void {
-            while (!ctx.done.load(.acquire)) {
-                if (ctx.cancel_flag.load(.acquire)) {
-                    if (comptime @import("builtin").os.tag == .windows) {
-                        _ = ctx.child.kill() catch {};
-                    } else {
-                        std.posix.kill(ctx.child.id, std.posix.SIG.TERM) catch {};
-                    }
-                    break;
-                }
-                std_compat.thread.sleep(20 * std.time.ns_per_ms);
-            }
-        }
-    }.run;
-    var done = AtomicBool.init(false);
-    var watcher: ?std.Thread = null;
-    var cancel_ctx: CancelCtx = undefined;
-    if (cancel_flag) |flag| {
-        cancel_ctx = .{ .child = &child, .cancel_flag = flag, .done = &done };
-        watcher = std.Thread.spawn(.{}, watcherFn, .{&cancel_ctx}) catch null;
-    }
-    defer {
-        done.store(true, .release);
-        if (watcher) |t| t.join();
-    }
-
-    if (body) |b| {
-        if (child.stdin) |stdin_file| {
-            stdin_file.writeAll(b) catch {
-                stdin_file.close();
-                child.stdin = null;
-                _ = child.kill() catch {};
-                _ = child.wait() catch {};
-                return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
-            };
-            stdin_file.close();
-            child.stdin = null;
-        } else {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
-        }
-    }
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, max_response_size + 64) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
-    };
-    errdefer allocator.free(stdout);
-
-    const stderr_raw = if (child.stderr) |stderr_file|
-        stderr_file.readToEndAlloc(allocator, 16 * 1024) catch null
-    else
-        null;
-    defer if (stderr_raw) |buf| allocator.free(buf);
-
-    var stderr_copy: ?[]u8 = try duplicateTrimmedStderr(allocator, stderr_raw);
-    defer if (stderr_copy) |buf| allocator.free(buf);
-
-    const term = child.wait() catch return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
-    switch (term) {
-        .exited => |code| if (code != 0 and !(cancel_flag != null and cancel_flag.?.load(.acquire))) {
-            if (stderr_out) |out| {
-                out.* = stderr_copy;
-                stderr_copy = null;
-            }
-            return error.CurlFailed;
-        },
-        else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
-    }
-
-    if (cancel_flag != null and cancel_flag.?.load(.acquire)) return error.CurlInterrupted;
-
-    const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse {
-        if (stderr_out) |out| {
-            out.* = stderr_copy;
-            stderr_copy = null;
-        }
-        return error.CurlParseError;
-    };
-    const status_raw = std.mem.trim(u8, stdout[status_sep + 1 ..], " \t\r\n");
-    if (status_raw.len != 3) {
-        if (stderr_out) |out| {
-            out.* = stderr_copy;
-            stderr_copy = null;
-        }
-        return error.CurlParseError;
-    }
-    const status_code = std.fmt.parseInt(u16, status_raw, 10) catch {
-        if (stderr_out) |out| {
-            out.* = stderr_copy;
-            stderr_copy = null;
-        }
-        return error.CurlParseError;
-    };
-    const body_slice = stdout[0..status_sep];
-    const response_body = try allocator.dupe(u8, body_slice);
-    allocator.free(stdout);
-
-    return .{
-        .status_code = status_code,
-        .body = response_body,
-    };
-}
-
-fn duplicateTrimmedStderr(allocator: std.mem.Allocator, raw: ?[]const u8) !?[]u8 {
-    const bytes = raw orelse return null;
-    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
-    if (trimmed.len == 0) return null;
-    const copied = try allocator.dupe(u8, trimmed);
-    return copied;
+    allocator.free(response.headers);
+    return .{ .status_code = response.status, .body = response.body };
 }
 
 fn ensureTlsCaBundleLoaded(client: *std.http.Client) !void {
@@ -860,11 +667,11 @@ test "http_request parameters JSON is valid" {
 }
 
 test "shouldUsePinnedResolve skips allowlisted hostname" {
-    try std.testing.expect(!shouldUsePinnedResolve("searx.internal", "searx.internal"));
+    try std.testing.expect(!http_util.shouldUsePinnedResolve("searx.internal", "searx.internal"));
 }
 
 test "shouldUsePinnedResolve keeps pinning resolved hostname" {
-    try std.testing.expect(shouldUsePinnedResolve("example.com", "93.184.216.34"));
+    try std.testing.expect(http_util.shouldUsePinnedResolve("example.com", "93.184.216.34"));
 }
 
 test "validateMethod case insensitive" {
@@ -897,19 +704,6 @@ test "buildHttpRequestErrorMessage includes TLS hint" {
     defer std.testing.allocator.free(msg);
     try std.testing.expect(std.mem.indexOf(u8, msg, "system CA certificates") != null);
 }
-
-test "duplicateTrimmedStderr trims non-empty stderr" {
-    const copied = (try duplicateTrimmedStderr(std.testing.allocator, "\n curl: (6) Could not resolve host \n")).?;
-    defer std.testing.allocator.free(copied);
-    try std.testing.expectEqualStrings("curl: (6) Could not resolve host", copied);
-}
-
-test "duplicateTrimmedStderr ignores empty stderr" {
-    try std.testing.expect((try duplicateTrimmedStderr(std.testing.allocator, "  \n\t  ")) == null);
-    try std.testing.expect((try duplicateTrimmedStderr(std.testing.allocator, null)) == null);
-}
-
-// ── parseHeaders tests ──────────────────────────────────────
 
 test "parseHeaders basic" {
     const headers = try parseHeaders(std.testing.allocator, "{\"Content-Type\": \"application/json\"}");

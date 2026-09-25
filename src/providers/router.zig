@@ -158,6 +158,8 @@ pub const RouterProvider = struct {
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
         .supports_streaming = supportsStreamingImpl,
+        .supportsStreamingTools = supportsStreamingToolsImpl,
+        .supportsToolsForModel = supportsToolsForModelImpl,
         .stream_chat = streamChatImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
@@ -222,6 +224,18 @@ pub const RouterProvider = struct {
         const provider_idx = resolved[0];
         if (provider_idx >= self.providers.len) return false;
         return self.providers[provider_idx].supportsNativeTools();
+    }
+
+    fn supportsStreamingToolsImpl(ptr: *anyopaque) bool {
+        const self: *RouterProvider = @ptrCast(@alignCast(ptr));
+        return supportsToolsForModelImpl(ptr, self.default_model, true);
+    }
+
+    fn supportsToolsForModelImpl(ptr: *anyopaque, model: []const u8, streaming: bool) bool {
+        const self: *RouterProvider = @ptrCast(@alignCast(ptr));
+        const resolved = self.resolve(model);
+        if (resolved[0] >= self.providers.len) return false;
+        return self.providers[resolved[0]].supportsToolsForModel(resolved[1], streaming);
     }
 
     fn supportsVisionImpl(ptr: *anyopaque) bool {
@@ -327,6 +341,7 @@ const MockProvider = struct {
         .supportsNativeTools = mockSupportsNativeTools,
         .warmup = mockWarmup,
         .supports_streaming = mockSupportsStreaming,
+        .supportsStreamingTools = mockSupportsNativeTools,
         .stream_chat = mockStreamChat,
         .supports_vision = mockSupportsVision,
         .getName = mockGetName,
@@ -815,6 +830,22 @@ test "vtable supportsNativeTools follows default model route" {
     defer prov.deinit();
 
     try std.testing.expect(prov.supportsNativeTools());
+}
+
+test "streamed tool support follows selected route instead of unrelated providers" {
+    const provider_names = [_][]const u8{ "default", "tools" };
+    var mock_default = MockProvider.init("ok", false);
+    var mock_tools = MockProvider.init("ok", true);
+    const providers = [_]Provider{ mock_default.provider(), mock_tools.provider() };
+    const routes = [_]RouterProvider.RouteEntry{
+        .{ .hint = "tools", .route = .{ .provider_name = "tools", .model = "tools-model" } },
+    };
+    var router = try RouterProvider.init(std.testing.allocator, &provider_names, &providers, &routes, "hint:tools");
+    const prov = router.provider();
+    defer prov.deinit();
+
+    try std.testing.expect(prov.supportsToolsForModel("hint:tools", true));
+    try std.testing.expect(!prov.supportsToolsForModel("plain-model", true));
 }
 
 test "vtable supportsVisionForModel follows hint routing" {

@@ -369,6 +369,8 @@ pub const ReliableProvider = struct {
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
         .supports_streaming = supportsStreamingImpl,
+        .supportsStreamingTools = supportsStreamingToolsImpl,
+        .supportsToolsForModel = supportsToolsForModelImpl,
         .stream_chat = streamChatImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
@@ -653,6 +655,20 @@ pub const ReliableProvider = struct {
         return false;
     }
 
+    fn supportsStreamingToolsImpl(ptr: *anyopaque) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        return self.inner.supportsStreamingTools();
+    }
+
+    fn supportsToolsForModelImpl(ptr: *anyopaque, model: []const u8, streaming: bool) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        const target = self.resolveProviderTarget(model);
+        if (target.explicit or streaming) {
+            return target.provider.supportsToolsForModel(target.model, streaming);
+        }
+        return supportsNativeToolsImpl(ptr);
+    }
+
     fn supportsVisionImpl(ptr: *anyopaque) bool {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
         if (self.inner.supportsVision()) return true;
@@ -859,6 +875,7 @@ const MockInnerProvider = struct {
         .chatWithSystem = mockChatWithSystem,
         .chat = mockChat,
         .supportsNativeTools = mockSupportsNativeTools,
+        .supportsStreamingTools = mockSupportsNativeTools,
         .supports_vision = mockSupportsVision,
         .getName = mockGetName,
         .deinit = mockDeinit,
@@ -1182,6 +1199,16 @@ test "ReliableProvider vtable delegates supportsNativeTools" {
     var mock_no = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
     var reliable_no = ReliableProvider.initWithProvider(mock_no.toProvider(), 0, 50);
     try std.testing.expect(reliable_no.provider().supportsNativeTools() == false);
+}
+
+test "streamed tools use selected primary despite an incapable fallback" {
+    var primary = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = true };
+    var fallback = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
+    const extras = [_]ProviderEntry{.{ .name = "fallback", .provider = fallback.toProvider() }};
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50).withExtras(&extras);
+    const provider = reliable.provider();
+    try std.testing.expect(provider.supportsToolsForModel("primary-model", true));
+    try std.testing.expect(!provider.supportsToolsForModel("fallback/other-model", true));
 }
 
 test "ReliableProvider supportsVision checks full provider chain" {

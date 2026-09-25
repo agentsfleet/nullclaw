@@ -1,42 +1,19 @@
 //! Shared HTTP utilities.
 //!
-//! Keeps legacy curl helpers for non-secret requests, but routes credentialed
-//! headers and sensitive token URLs through std.http so secrets are not exposed
-//! through child process argv.
+//! Buffered and streaming requests share the in-process libcurl transport.
+//! Existing public helper names remain for provider compatibility.
 
 const std = @import("std");
 const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const AtomicBool = std.atomic.Value(bool);
 const net_security = @import("net_security.zig");
-const platform = @import("platform.zig");
+const native_http = @import("native_http.zig");
 
 const log = std.log.scoped(.http_util);
 threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
 const DEFAULT_CURL_GET_MAX_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_CURL_POST_MAX_BYTES: usize = 8 * 1024 * 1024;
-const MAX_CURL_STDERR_BYTES: usize = 16 * 1024;
-pub const CredentialedCurlArgError = error{CredentialedCurlArgRejected};
-
-fn classifyCurlExitCode(code: u8) []const u8 {
-    return switch (code) {
-        6 => "dns",
-        7 => "connect",
-        28 => "timeout",
-        35, 51, 58, 60 => "tls",
-        else => "other",
-    };
-}
-
-pub fn mapCurlExitCodeToError(code: u8) anyerror {
-    return switch (code) {
-        6 => error.CurlDnsError,
-        7 => error.CurlConnectError,
-        28 => error.CurlTimeout,
-        35, 51, 58, 60 => error.CurlTlsError,
-        else => error.CurlFailed,
-    };
-}
 
 pub fn isCurlTransportError(err: anyerror) bool {
     return switch (err) {
@@ -58,91 +35,12 @@ pub fn preserveCurlTransportError(err: anyerror, fallback: anyerror) anyerror {
     return if (isCurlTransportError(err)) err else fallback;
 }
 
-const StderrCapture = struct {
-    file: ?std_compat.fs.File = null,
-    buffer: [MAX_CURL_STDERR_BYTES]u8 = undefined,
-    len: usize = 0,
-
-    fn trimmed(self: *const StderrCapture) ?[]const u8 {
-        const bytes = std.mem.trim(u8, self.buffer[0..self.len], " \t\r\n");
-        if (bytes.len == 0) return null;
-        return bytes;
-    }
-};
-
-fn stderrCaptureMain(ctx: *StderrCapture) void {
-    const file = ctx.file orelse return;
-    while (ctx.len < ctx.buffer.len) {
-        const n = file.read(ctx.buffer[ctx.len..]) catch return;
-        if (n == 0) return;
-        ctx.len += n;
-    }
-
-    // Keep draining after the retained buffer is full so a noisy child cannot
-    // block forever on a full stderr pipe while the parent waits on stdout.
-    var discard: [1024]u8 = undefined;
-    while (true) {
-        const n = file.read(&discard) catch return;
-        if (n == 0) return;
-    }
-}
-
-fn startStderrCapture(child: *std_compat.process.Child, capture: *StderrCapture) ?std.Thread {
-    capture.* = .{ .file = child.stderr };
-    if (capture.file == null) return null;
-    return std.Thread.spawn(.{}, stderrCaptureMain, .{capture}) catch null;
-}
-
-fn finishStderrCapture(thread_opt: *?std.Thread, capture: *const StderrCapture) ?[]const u8 {
-    if (thread_opt.*) |thread| {
-        thread.join();
-        thread_opt.* = null;
-    }
-    return capture.trimmed();
-}
-
-fn logCurlExitFailure(op: []const u8, code: u8, stderr_msg: ?[]const u8) void {
-    if (stderr_msg) |msg| {
-        log.warn("curl {s} failed: exit_code={d} class={s} stderr={s}", .{ op, code, classifyCurlExitCode(code), msg });
-    } else {
-        log.warn("curl {s} failed: exit_code={d} class={s}", .{ op, code, classifyCurlExitCode(code) });
-    }
-}
-
-fn logCurlWaitFailure(op: []const u8, err: anyerror, stderr_msg: ?[]const u8) void {
-    if (stderr_msg) |msg| {
-        log.err("curl {s} child.wait failed: {} stderr={s}", .{ op, err, msg });
-    } else {
-        log.err("curl {s} child.wait failed: {}", .{ op, err });
-    }
-}
-
 pub fn setThreadInterruptFlag(flag: ?*const AtomicBool) void {
     thread_interrupt_flag = flag;
 }
 
 pub fn currentThreadInterruptFlag() ?*const AtomicBool {
     return thread_interrupt_flag;
-}
-
-const CancelWatcherCtx = struct {
-    child: *std_compat.process.Child,
-    cancel_flag: *const AtomicBool,
-    done: *AtomicBool,
-};
-
-fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
-    while (!ctx.done.load(.acquire)) {
-        if (ctx.cancel_flag.load(.acquire)) {
-            if (comptime @import("builtin").os.tag == .windows) {
-                _ = ctx.child.kill() catch {};
-            } else {
-                std.posix.kill(ctx.child.id, std.posix.SIG.TERM) catch {};
-            }
-            break;
-        }
-        std_compat.thread.sleep(20 * std.time.ns_per_ms);
-    }
 }
 
 pub const HttpResponse = struct {
@@ -155,171 +53,6 @@ pub const HttpResponseWithHeaders = struct {
     headers: []u8,
     body: []u8,
 };
-
-fn headerName(header: []const u8) []const u8 {
-    const colon = std.mem.indexOfScalar(u8, header, ':') orelse return header;
-    return std.mem.trim(u8, header[0..colon], " \t\r\n");
-}
-
-fn isCredentialHeader(header: []const u8) bool {
-    const name = headerName(header);
-    return std.ascii.eqlIgnoreCase(name, "authorization") or
-        std.ascii.eqlIgnoreCase(name, "x-api-key") or
-        std.ascii.eqlIgnoreCase(name, "api-key") or
-        std.ascii.eqlIgnoreCase(name, "x-goog-api-key") or
-        std.ascii.eqlIgnoreCase(name, "anthropic-api-key") or
-        std.ascii.eqlIgnoreCase(name, "cookie");
-}
-
-fn hasCredentialedCurlArgs(url: []const u8, headers: []const []const u8) bool {
-    if (hasSensitiveUrlToken(url)) return true;
-    for (headers) |header| {
-        if (isCredentialHeader(header)) return true;
-    }
-    return false;
-}
-
-fn hasSensitiveUrlToken(url: []const u8) bool {
-    const query_start = std.mem.indexOfScalar(u8, url, '?') orelse return false;
-    var query = url[query_start + 1 ..];
-    while (query.len > 0) {
-        const amp = std.mem.indexOfScalar(u8, query, '&') orelse query.len;
-        const pair = query[0..amp];
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
-        const key = pair[0..eq];
-        if (std.ascii.eqlIgnoreCase(key, "key") or
-            std.ascii.eqlIgnoreCase(key, "api_key") or
-            std.ascii.eqlIgnoreCase(key, "apikey") or
-            std.ascii.eqlIgnoreCase(key, "access_token") or
-            std.ascii.eqlIgnoreCase(key, "token") or
-            std.ascii.eqlIgnoreCase(key, "auth_token"))
-        {
-            return true;
-        }
-        if (amp >= query.len) break;
-        query = query[amp + 1 ..];
-    }
-    return false;
-}
-
-pub fn validateNoCredentialedCurlArgs(url: []const u8, headers: []const []const u8) CredentialedCurlArgError!void {
-    if (hasSensitiveUrlToken(url)) return error.CredentialedCurlArgRejected;
-    for (headers) |header| {
-        if (isCredentialHeader(header)) return error.CredentialedCurlArgRejected;
-    }
-}
-
-pub const CurlHeaderArg = struct {
-    arg: ?[]const u8 = null,
-    temp_path_buf: [std_compat.fs.max_path_bytes]u8 = undefined,
-    temp_path_len: usize = 0,
-    uses_temp_file: bool = false,
-
-    pub fn deinit(self: *const CurlHeaderArg, allocator: Allocator) void {
-        if (!self.uses_temp_file) return;
-        std_compat.fs.deleteFileAbsolute(self.temp_path_buf[0..self.temp_path_len]) catch {};
-        if (self.arg) |arg| allocator.free(arg);
-    }
-};
-
-fn validateCurlHeaderLine(header: []const u8) !void {
-    if (std.mem.indexOfAny(u8, header, "\r\n") != null) return error.InvalidHeader;
-}
-
-pub fn prepareCurlHeaderArg(allocator: Allocator, headers: []const []const u8) !CurlHeaderArg {
-    if (headers.len == 0) return .{};
-
-    var prepared: CurlHeaderArg = .{};
-    const tmp_dir_path = platform.getTempDir(allocator) catch return error.TempDirNotFound;
-    defer allocator.free(tmp_dir_path);
-
-    var tmp_dir = std_compat.fs.openDirAbsolute(tmp_dir_path, .{}) catch return error.TempDirNotFound;
-    defer tmp_dir.close();
-
-    var tmp_file = blk: {
-        var attempt: u8 = 0;
-        while (attempt < 8) : (attempt += 1) {
-            const header_path = std.fmt.bufPrint(
-                &prepared.temp_path_buf,
-                "{s}{s}curl_headers_{x}.tmp",
-                .{ tmp_dir_path, std_compat.fs.path.sep_str, std_compat.crypto.random.int(u64) },
-            ) catch return error.PathTooLong;
-            prepared.temp_path_len = header_path.len;
-
-            break :blk tmp_dir.createFile(
-                header_path[tmp_dir_path.len + 1 ..],
-                .{ .truncate = true, .exclusive = true, .permissions = std_compat.fs.permissionsFromMode(0o600) },
-            ) catch |err| switch (err) {
-                error.PathAlreadyExists => continue,
-                else => return error.TempFileCreateFailed,
-            };
-        }
-        return error.TempFileCreateFailed;
-    };
-    errdefer std_compat.fs.deleteFileAbsolute(prepared.temp_path_buf[0..prepared.temp_path_len]) catch {};
-
-    for (headers) |header| {
-        validateCurlHeaderLine(header) catch {
-            tmp_file.close();
-            return error.InvalidHeader;
-        };
-        tmp_file.writeAll(header) catch {
-            tmp_file.close();
-            return error.TempFileWriteFailed;
-        };
-        tmp_file.writeAll("\n") catch {
-            tmp_file.close();
-            return error.TempFileWriteFailed;
-        };
-    }
-    tmp_file.close();
-
-    for (prepared.temp_path_buf[0..prepared.temp_path_len]) |*c| {
-        if (c.* == '\\') c.* = '/';
-    }
-
-    prepared.arg = try std.fmt.allocPrint(allocator, "@{s}", .{prepared.temp_path_buf[0..prepared.temp_path_len]});
-    prepared.uses_temp_file = true;
-    return prepared;
-}
-
-fn credentialedCurlUsesHttpFallback(url: []const u8, headers: []const []const u8, resolve_entry: ?[]const u8) bool {
-    return hasCredentialedCurlArgs(url, headers) and resolve_entry == null;
-}
-
-fn prepareCurlHeadersForArgv(allocator: Allocator, url: []const u8, headers: []const []const u8) !CurlHeaderArg {
-    if (hasCredentialedCurlArgs(url, headers)) {
-        if (hasSensitiveUrlToken(url)) return error.CredentialedCurlArgRejected;
-        return try prepareCurlHeaderArg(allocator, headers);
-    }
-
-    try validateNoCredentialedCurlArgs(url, headers);
-    return .{};
-}
-
-fn appendPreparedCurlHeaders(
-    argv_buf: []([]const u8),
-    argc: *usize,
-    headers: []const []const u8,
-    prepared_arg: ?[]const u8,
-) !void {
-    if (prepared_arg) |headers_arg| {
-        if (argc.* + 2 > argv_buf.len) return error.CurlArgsOverflow;
-        argv_buf[argc.*] = "-H";
-        argc.* += 1;
-        argv_buf[argc.*] = headers_arg;
-        argc.* += 1;
-        return;
-    }
-
-    for (headers) |hdr| {
-        if (argc.* + 2 > argv_buf.len) break;
-        argv_buf[argc.*] = "-H";
-        argc.* += 1;
-        argv_buf[argc.*] = hdr;
-        argc.* += 1;
-    }
-}
 
 fn parseHeader(header: []const u8) ?std.http.Header {
     const colon = std.mem.indexOfScalar(u8, header, ':') orelse return null;
@@ -490,7 +223,6 @@ const proxy_env_var_names = [_][]const u8{
 };
 const http_proxy_env_var_names = [_][]const u8{
     "http_proxy",
-    "HTTP_PROXY",
     "all_proxy",
     "ALL_PROXY",
 };
@@ -544,11 +276,11 @@ fn shouldUseCurlResolve(host: []const u8) bool {
     return std.mem.indexOfScalar(u8, net_security.stripHostBrackets(host), ':') == null;
 }
 
-fn shouldUsePinnedResolve(host: []const u8, connect_host: []const u8) bool {
+pub fn shouldUsePinnedResolve(host: []const u8, connect_host: []const u8) bool {
     return shouldUseCurlResolve(host) and !std.mem.eql(u8, host, connect_host);
 }
 
-fn buildCurlResolveEntry(
+pub fn buildCurlResolveEntry(
     allocator: Allocator,
     host: []const u8,
     port: u16,
@@ -564,7 +296,7 @@ fn buildCurlResolveEntry(
     return std.fmt.allocPrint(allocator, "{s}:{d}:{s}", .{ host_for_resolve, port, connect_target });
 }
 
-/// Build an optional curl `--resolve` entry for remote provider requests.
+/// Build an optional libcurl address pin for remote provider requests.
 /// Remote hosts are pinned to a concrete globally-routable address; explicit
 /// local/private hosts are left untouched so intentional local providers still work.
 ///
@@ -600,26 +332,11 @@ fn mapResolveConnectHostError(host: []const u8, err: net_security.ResolveConnect
     };
 }
 
-pub fn appendCurlResolveArgs(argv_buf: []([]const u8), argc: *usize, resolve_entry: ?[]const u8) void {
-    if (resolve_entry) |entry| {
-        // A forward proxy resolves the origin itself, bypassing curl's --resolve
-        // pin. Force pinned requests direct even when proxy env vars are set.
-        argv_buf[argc.*] = "--noproxy";
-        argc.* += 1;
-        argv_buf[argc.*] = "*";
-        argc.* += 1;
-        argv_buf[argc.*] = "--resolve";
-        argc.* += 1;
-        argv_buf[argc.*] = entry;
-        argc.* += 1;
-    }
-}
-
-/// HTTP POST via curl subprocess with optional proxy and timeout.
+/// HTTP POST via in-process libcurl with optional proxy and timeout.
 ///
 /// `headers` is a slice of header strings (e.g. `"Authorization: Bearer xxx"`).
 /// `proxy` is an optional proxy URL (e.g. `"socks5://host:port"`).
-/// `max_time` is an optional --max-time value as a string (e.g. `"300"`).
+/// `max_time` is an optional total timeout as a string (e.g. `"300"`).
 /// Returns the response body. Caller owns returned memory.
 pub fn curlPostWithProxy(
     allocator: Allocator,
@@ -654,7 +371,7 @@ pub fn curlPostWithProxyAndResolve(
     );
 }
 
-/// HTTP POST with application/x-www-form-urlencoded body via curl subprocess,
+/// HTTP POST with application/x-www-form-urlencoded body via libcurl,
 /// with optional proxy and timeout.
 pub fn curlPostFormWithProxy(
     allocator: Allocator,
@@ -687,6 +404,59 @@ pub fn curlPostFormWithProxyAndResolve(
     );
 }
 
+fn nativeRequest(
+    allocator: Allocator,
+    method: native_http.Method,
+    url: []const u8,
+    body: ?[]const u8,
+    headers: []const []const u8,
+    content_type_header: ?[]const u8,
+    proxy: ?[]const u8,
+    max_time: ?[]const u8,
+    resolve_entry: ?[]const u8,
+    max_body_bytes: usize,
+    capture_headers: bool,
+    fail_http_status: bool,
+) !native_http.Response {
+    const additional: usize = if (content_type_header == null) 0 else 1;
+    if (headers.len + additional > 32) return error.TooManyHeaders;
+    var all_headers: [32][]const u8 = undefined;
+    if (content_type_header) |header| all_headers[0] = header;
+    for (headers, 0..) |header, i| all_headers[i + additional] = header;
+    const timeout: ?u64 = if (max_time) |value|
+        std.fmt.parseInt(u64, value, 10) catch return error.CurlFailed
+    else
+        null;
+    const configured_proxy = if (proxy == null) try getProxyForUrl(allocator, url) else null;
+    defer if (configured_proxy) |value| allocator.free(value);
+    var response = try native_http.perform(allocator, .{
+        .method = method,
+        .url = url,
+        .body = body,
+        .headers = all_headers[0 .. headers.len + additional],
+        .proxy = proxy orelse configured_proxy,
+        .resolve_entry = resolve_entry,
+        .timeout_secs = timeout,
+        .max_body_bytes = max_body_bytes,
+        .capture_headers = capture_headers,
+        .interrupt_flag = thread_interrupt_flag,
+    });
+    if (response.transport_error) |err| {
+        response.deinit(allocator);
+        return err;
+    }
+    if (fail_http_status and response.status >= 400) {
+        response.deinit(allocator);
+        return error.CurlFailed;
+    }
+    return response;
+}
+
+fn bodyOnly(allocator: Allocator, response: native_http.Response) []u8 {
+    allocator.free(response.headers);
+    return response.body;
+}
+
 fn curlRequestWithProxy(
     allocator: Allocator,
     method: []const u8,
@@ -698,131 +468,17 @@ fn curlRequestWithProxy(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) ![]u8 {
-    if (credentialedCurlUsesHttpFallback(url, headers, resolve_entry)) {
-        const method_enum = std.meta.stringToEnum(std.http.Method, method) orelse return error.UnsupportedHttpMethod;
-        const content_type = contentTypeHeaderValue(content_type_header) orelse return error.InvalidHeader;
-        const resp = try httpRequestWithStatus(allocator, method_enum, url, body, headers, content_type, proxy);
-        return resp.body;
-    }
-    var prepared_headers = try prepareCurlHeadersForArgv(allocator, url, headers);
-    defer prepared_headers.deinit(allocator);
-
-    var argv_buf: [40][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = method;
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = content_type_header;
-    argc += 1;
-
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
-
-    appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
-
-    if (max_time) |mt| {
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = mt;
-        argc += 1;
-    }
-
-    try appendPreparedCurlHeaders(argv_buf[0..], &argc, headers, prepared_headers.arg);
-
-    // Pass payload via stdin to avoid OS argv length limits for large JSON
-    // bodies (e.g. multimodal base64 images).
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = "@-";
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-    const cancel_flag = thread_interrupt_flag;
-    var cancel_done = AtomicBool.init(false);
-    var cancel_watcher: ?std.Thread = null;
-    var watcher_ctx: CancelWatcherCtx = undefined;
-    if (cancel_flag) |flag| {
-        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
-        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
-    }
-    defer {
-        cancel_done.store(true, .release);
-        if (cancel_watcher) |t| t.join();
-    }
-    var stderr_capture = StderrCapture{};
-    var stderr_thread = startStderrCapture(&child, &stderr_capture);
-    defer if (stderr_thread) |thread| thread.join();
-
-    if (child.stdin) |stdin_file| {
-        stdin_file.writeAll(body) catch {
-            stdin_file.close();
-            child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
-        };
-        stdin_file.close();
-        child.stdin = null;
-    } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
-    }
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, DEFAULT_CURL_POST_MAX_BYTES) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
-    };
-
-    const term = child.wait() catch |err| {
-        _ = child.kill() catch {};
-        const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
-        logCurlWaitFailure(method, err, stderr_msg);
-        allocator.free(stdout);
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
-    };
-    const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            logCurlExitFailure(method, code, stderr_msg);
-            allocator.free(stdout);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
-        },
-        else => {
-            allocator.free(stdout);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
-        },
-    }
-
-    return stdout;
+    const parsed_method: native_http.Method = if (std.mem.eql(u8, method, "POST")) .post else if (std.mem.eql(u8, method, "PUT")) .put else return error.UnsupportedHttpMethod;
+    const response = try nativeRequest(allocator, parsed_method, url, body, headers, content_type_header, proxy, max_time, resolve_entry, DEFAULT_CURL_POST_MAX_BYTES, false, false);
+    return bodyOnly(allocator, response);
 }
 
-/// HTTP POST via curl subprocess (no proxy, no timeout).
+/// HTTP POST via in-process libcurl, using configured proxy settings.
 pub fn curlPost(allocator: Allocator, url: []const u8, body: []const u8, headers: []const []const u8) ![]u8 {
     return curlPostWithProxy(allocator, url, body, headers, null, null);
 }
 
-/// HTTP POST with application/x-www-form-urlencoded body via curl subprocess.
+/// HTTP POST with application/x-www-form-urlencoded body via libcurl.
 ///
 /// `body` must already be percent-encoded form data (e.g. `"key=val&key2=val2"`).
 /// Returns the response body. Caller owns returned memory.
@@ -830,7 +486,7 @@ pub fn curlPostForm(allocator: Allocator, url: []const u8, body: []const u8) ![]
     return curlPostFormWithProxy(allocator, url, body, null, null);
 }
 
-/// HTTP POST via curl subprocess and include HTTP status code in response.
+/// HTTP POST via in-process libcurl and include HTTP status code in response.
 /// Caller owns `response.body`.
 pub fn curlPostWithStatus(
     allocator: Allocator,
@@ -849,7 +505,7 @@ pub fn curlGetWithStatus(
     return curlGetWithStatusAndTimeout(allocator, url, headers, null);
 }
 
-/// HTTP POST via curl subprocess and include HTTP status code in response,
+/// HTTP POST via in-process libcurl and include HTTP status code in response,
 /// with optional --max-time timeout.
 /// Caller owns `response.body`.
 pub fn curlPostWithStatusAndTimeout(
@@ -870,126 +526,11 @@ pub fn curlPostWithStatusAndTimeoutAndResolve(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) !HttpResponse {
-    if (credentialedCurlUsesHttpFallback(url, headers, resolve_entry)) {
-        return httpRequestWithStatus(allocator, .POST, url, body, headers, "application/json", null);
-    }
-    var prepared_headers = try prepareCurlHeadersForArgv(allocator, url, headers);
-    defer prepared_headers.deinit(allocator);
-
-    var argv_buf: [48][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-
-    if (max_time) |mt| {
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = mt;
-        argc += 1;
-    }
-
-    appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
-
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
-
-    try appendPreparedCurlHeaders(argv_buf[0..], &argc, headers, prepared_headers.arg);
-
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = "@-";
-    argc += 1;
-    argv_buf[argc] = "-w";
-    argc += 1;
-    argv_buf[argc] = "\n%{http_code}";
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-    const cancel_flag = thread_interrupt_flag;
-    var cancel_done = AtomicBool.init(false);
-    var cancel_watcher: ?std.Thread = null;
-    var watcher_ctx: CancelWatcherCtx = undefined;
-    if (cancel_flag) |flag| {
-        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
-        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
-    }
-    defer {
-        cancel_done.store(true, .release);
-        if (cancel_watcher) |t| t.join();
-    }
-    var stderr_capture = StderrCapture{};
-    var stderr_thread = startStderrCapture(&child, &stderr_capture);
-    defer if (stderr_thread) |thread| thread.join();
-
-    if (child.stdin) |stdin_file| {
-        stdin_file.writeAll(body) catch {
-            stdin_file.close();
-            child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
-        };
-        stdin_file.close();
-        child.stdin = null;
-    } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
-    }
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, DEFAULT_CURL_POST_MAX_BYTES) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
-    };
-    errdefer allocator.free(stdout);
-
-    const term = child.wait() catch |err| {
-        _ = child.kill() catch {};
-        const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
-        logCurlWaitFailure("POST", err, stderr_msg);
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
-    };
-    const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            logCurlExitFailure("POST", code, stderr_msg);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
-        },
-        else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
-    }
-
-    const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse return error.CurlParseError;
-    const status_raw = std.mem.trim(u8, stdout[status_sep + 1 ..], " \t\r\n");
-    if (status_raw.len != 3) return error.CurlParseError;
-    const status_code = std.fmt.parseInt(u16, status_raw, 10) catch return error.CurlParseError;
-    const body_slice = stdout[0..status_sep];
-    const response_body = try allocator.dupe(u8, body_slice);
-    allocator.free(stdout);
-
-    return .{
-        .status_code = status_code,
-        .body = response_body,
-    };
+    const response = try nativeRequest(allocator, .post, url, body, headers, "Content-Type: application/json", null, max_time, resolve_entry, DEFAULT_CURL_POST_MAX_BYTES, false, false);
+    return .{ .status_code = response.status, .body = bodyOnly(allocator, response) };
 }
 
-/// HTTP POST via curl subprocess and include HTTP status code and response headers,
+/// HTTP POST via in-process libcurl and include HTTP status code and response headers,
 /// with optional --max-time timeout.
 /// Caller owns `response.headers` and `response.body`.
 pub fn curlPostWithStatusHeadersAndTimeout(
@@ -1010,148 +551,8 @@ pub fn curlPostWithStatusHeadersAndTimeoutAndResolve(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) !HttpResponseWithHeaders {
-    if (credentialedCurlUsesHttpFallback(url, headers, resolve_entry)) {
-        return httpRequestWithStatusAndHeaders(allocator, .POST, url, body, headers, "application/json", null);
-    }
-    var prepared_headers = try prepareCurlHeadersForArgv(allocator, url, headers);
-    defer prepared_headers.deinit(allocator);
-
-    var argv_buf: [56][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-
-    if (max_time) |mt| {
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = mt;
-        argc += 1;
-    }
-
-    appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
-
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
-
-    try appendPreparedCurlHeaders(argv_buf[0..], &argc, headers, prepared_headers.arg);
-
-    // Dump response headers to stdout so we can capture session IDs.
-    argv_buf[argc] = "-D";
-    argc += 1;
-    argv_buf[argc] = "-";
-    argc += 1;
-
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = "@-";
-    argc += 1;
-    argv_buf[argc] = "-w";
-    argc += 1;
-    argv_buf[argc] = "\n%{http_code}";
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-    const cancel_flag = thread_interrupt_flag;
-    var cancel_done = AtomicBool.init(false);
-    var cancel_watcher: ?std.Thread = null;
-    var watcher_ctx: CancelWatcherCtx = undefined;
-    if (cancel_flag) |flag| {
-        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
-        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
-    }
-    defer {
-        cancel_done.store(true, .release);
-        if (cancel_watcher) |t| t.join();
-    }
-    var stderr_capture = StderrCapture{};
-    var stderr_thread = startStderrCapture(&child, &stderr_capture);
-    defer if (stderr_thread) |thread| thread.join();
-
-    if (child.stdin) |stdin_file| {
-        stdin_file.writeAll(body) catch {
-            stdin_file.close();
-            child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
-        };
-        stdin_file.close();
-        child.stdin = null;
-    } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
-    }
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
-    };
-    errdefer allocator.free(stdout);
-
-    const term = child.wait() catch |err| {
-        _ = child.kill() catch {};
-        const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
-        logCurlWaitFailure("POST", err, stderr_msg);
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
-    };
-    const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            logCurlExitFailure("POST", code, stderr_msg);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
-        },
-        else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
-    }
-
-    const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse return error.CurlParseError;
-    const status_raw = std.mem.trim(u8, stdout[status_sep + 1 ..], " \t\r\n");
-    if (status_raw.len != 3) return error.CurlParseError;
-    const status_code = std.fmt.parseInt(u16, status_raw, 10) catch return error.CurlParseError;
-
-    const payload = stdout[0..status_sep];
-    const header_end_crlf = std.mem.indexOf(u8, payload, "\r\n\r\n");
-    const header_end_lf = std.mem.indexOf(u8, payload, "\n\n");
-
-    var headers_slice: []const u8 = "";
-    var body_slice: []const u8 = payload;
-
-    if (header_end_crlf) |pos| {
-        headers_slice = payload[0..pos];
-        body_slice = payload[pos + 4 ..];
-    } else if (header_end_lf) |pos| {
-        headers_slice = payload[0..pos];
-        body_slice = payload[pos + 2 ..];
-    }
-
-    const headers_out = try allocator.dupe(u8, headers_slice);
-    errdefer allocator.free(headers_out);
-    const body_out = try allocator.dupe(u8, body_slice);
-
-    allocator.free(stdout);
-
-    return .{
-        .status_code = status_code,
-        .headers = headers_out,
-        .body = body_out,
-    };
+    const response = try nativeRequest(allocator, .post, url, body, headers, "Content-Type: application/json", null, max_time, resolve_entry, 1024 * 1024, true, false);
+    return .{ .status_code = response.status, .headers = response.headers, .body = response.body };
 }
 
 pub fn curlGetWithStatusAndTimeout(
@@ -1170,96 +571,11 @@ pub fn curlGetWithStatusAndTimeoutAndResolve(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) !HttpResponse {
-    if (credentialedCurlUsesHttpFallback(url, headers, resolve_entry)) {
-        return httpRequestWithStatus(allocator, .GET, url, null, headers, null, null);
-    }
-    var prepared_headers = try prepareCurlHeadersForArgv(allocator, url, headers);
-    defer prepared_headers.deinit(allocator);
-
-    var argv_buf: [48][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-
-    if (max_time) |mt| {
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = mt;
-        argc += 1;
-    }
-
-    appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
-
-    try appendPreparedCurlHeaders(argv_buf[0..], &argc, headers, prepared_headers.arg);
-
-    argv_buf[argc] = "-w";
-    argc += 1;
-    argv_buf[argc] = "\n%{http_code}";
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-    const cancel_flag = thread_interrupt_flag;
-    var cancel_done = AtomicBool.init(false);
-    var cancel_watcher: ?std.Thread = null;
-    var watcher_ctx: CancelWatcherCtx = undefined;
-    if (cancel_flag) |flag| {
-        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
-        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
-    }
-    defer {
-        cancel_done.store(true, .release);
-        if (cancel_watcher) |t| t.join();
-    }
-    var stderr_capture = StderrCapture{};
-    var stderr_thread = startStderrCapture(&child, &stderr_capture);
-    defer if (stderr_thread) |thread| thread.join();
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, DEFAULT_CURL_GET_MAX_BYTES) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
-    };
-    errdefer allocator.free(stdout);
-
-    const term = child.wait() catch |err| {
-        _ = child.kill() catch {};
-        const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
-        logCurlWaitFailure("GET", err, stderr_msg);
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
-    };
-    const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            logCurlExitFailure("GET", code, stderr_msg);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
-        },
-        else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
-    }
-
-    const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse return error.CurlParseError;
-    const status_raw = std.mem.trim(u8, stdout[status_sep + 1 ..], " \t\r\n");
-    if (status_raw.len != 3) return error.CurlParseError;
-    const status_code = std.fmt.parseInt(u16, status_raw, 10) catch return error.CurlParseError;
-    const body_slice = stdout[0..status_sep];
-    const response_body = try allocator.dupe(u8, body_slice);
-    allocator.free(stdout);
-
-    return .{
-        .status_code = status_code,
-        .body = response_body,
-    };
+    const response = try nativeRequest(allocator, .get, url, null, headers, null, null, max_time, resolve_entry, DEFAULT_CURL_GET_MAX_BYTES, false, false);
+    return .{ .status_code = response.status, .body = bodyOnly(allocator, response) };
 }
 
-/// HTTP PUT via curl subprocess (no proxy, no timeout).
+/// HTTP PUT via in-process libcurl, using configured proxy settings.
 pub fn curlPut(allocator: Allocator, url: []const u8, body: []const u8, headers: []const []const u8) ![]u8 {
     return curlRequestWithProxy(
         allocator,
@@ -1274,10 +590,10 @@ pub fn curlPut(allocator: Allocator, url: []const u8, body: []const u8, headers:
     );
 }
 
-/// HTTP GET via curl subprocess with optional proxy.
+/// HTTP GET via in-process libcurl with optional proxy.
 ///
 /// `headers` is a slice of header strings (e.g. `"Authorization: Bearer xxx"`).
-/// `timeout_secs` sets --max-time. Returns the response body. Caller owns returned memory.
+/// `timeout_secs` sets the total transfer deadline. Returns the response body. Caller owns returned memory.
 fn curlGetWithProxyAndResolve(
     allocator: Allocator,
     url: []const u8,
@@ -1287,91 +603,14 @@ fn curlGetWithProxyAndResolve(
     resolve_entry: ?[]const u8,
     max_bytes: usize,
 ) ![]u8 {
-    if (credentialedCurlUsesHttpFallback(url, headers, resolve_entry)) {
-        return httpRequest(allocator, .GET, url, null, headers, null, proxy);
-    }
-    var prepared_headers = try prepareCurlHeadersForArgv(allocator, url, headers);
-    defer prepared_headers.deinit(allocator);
-
-    var argv_buf: [48][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-sf";
-    argc += 1;
-    argv_buf[argc] = "--max-time";
-    argc += 1;
-    argv_buf[argc] = timeout_secs;
-    argc += 1;
-
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
-
-    appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
-
-    try appendPreparedCurlHeaders(argv_buf[0..], &argc, headers, prepared_headers.arg);
-
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-    const cancel_flag = thread_interrupt_flag;
-    var cancel_done = AtomicBool.init(false);
-    var cancel_watcher: ?std.Thread = null;
-    var watcher_ctx: CancelWatcherCtx = undefined;
-    if (cancel_flag) |flag| {
-        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
-        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
-    }
-    defer {
-        cancel_done.store(true, .release);
-        if (cancel_watcher) |t| t.join();
-    }
-    var stderr_capture = StderrCapture{};
-    var stderr_thread = startStderrCapture(&child, &stderr_capture);
-    defer if (stderr_thread) |thread| thread.join();
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, max_bytes) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
-    };
-
-    const term = child.wait() catch |err| {
-        _ = child.kill() catch {};
-        const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
-        logCurlWaitFailure("GET", err, stderr_msg);
-        return error.CurlWaitError;
-    };
-    const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            logCurlExitFailure("GET", code, stderr_msg);
-            allocator.free(stdout);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
-        },
-        else => {
-            allocator.free(stdout);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
-        },
-    }
-
-    return stdout;
+    const response = try nativeRequest(allocator, .get, url, null, headers, null, proxy, timeout_secs, resolve_entry, max_bytes, false, true);
+    return bodyOnly(allocator, response);
 }
 
-/// HTTP GET via curl subprocess with optional proxy.
+/// HTTP GET via in-process libcurl with optional proxy.
 ///
 /// `headers` is a slice of header strings (e.g. `"Authorization: Bearer xxx"`).
-/// `timeout_secs` sets --max-time. Returns the response body. Caller owns returned memory.
+/// `timeout_secs` sets the total transfer deadline. Returns the response body. Caller owns returned memory.
 pub fn curlGetWithProxy(
     allocator: Allocator,
     url: []const u8,
@@ -1382,7 +621,7 @@ pub fn curlGetWithProxy(
     return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, proxy, null, DEFAULT_CURL_GET_MAX_BYTES);
 }
 
-/// HTTP GET via curl subprocess with a pinned host mapping.
+/// HTTP GET via in-process libcurl with a pinned host mapping.
 ///
 /// `resolve_entry` must be in curl `--resolve` format: `host:port:address`.
 pub fn curlGetWithResolve(
@@ -1395,12 +634,12 @@ pub fn curlGetWithResolve(
     return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, null, resolve_entry, DEFAULT_CURL_GET_MAX_BYTES);
 }
 
-/// HTTP GET via curl subprocess (no proxy).
+/// HTTP GET via in-process libcurl, using configured proxy settings.
 pub fn curlGet(allocator: Allocator, url: []const u8, headers: []const []const u8, timeout_secs: []const u8) ![]u8 {
     return curlGetWithProxy(allocator, url, headers, timeout_secs, null);
 }
 
-/// HTTP GET via curl subprocess with a caller-provided response size cap.
+/// HTTP GET via in-process libcurl with a caller-provided response size cap.
 pub fn curlGetMaxBytes(
     allocator: Allocator,
     url: []const u8,
@@ -1411,11 +650,9 @@ pub fn curlGetMaxBytes(
     return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, null, null, max_bytes);
 }
 
-/// Read proxy URL from standard environment variables.
-/// Checks https_proxy/HTTPS_PROXY first, then http_proxy/HTTP_PROXY,
-/// then all_proxy/ALL_PROXY.
-/// Returns null if no proxy is set.
-/// Caller owns returned memory.
+/// Process-wide proxy override and scheme-specific environment lookup.
+/// Uppercase HTTP_PROXY is ignored for HTTP requests, matching libcurl's CGI
+/// safety rule. Caller owns a returned proxy string.
 var proxy_override_value: ?[]u8 = null;
 var proxy_override_mutex: std_compat.sync.Mutex = .{};
 
@@ -1511,176 +748,40 @@ pub fn initClientDefaultProxies(client: *std.http.Client, arena: Allocator) !voi
     try client.initDefaultProxies(arena, &env_map);
 }
 
-pub fn getProxyFromEnv(allocator: Allocator) !?[]const u8 {
-    var env_map = try buildProxyEnvMapFromProcess(allocator);
-    defer env_map.deinit();
-
-    if (try getProxyFromEnvMap(allocator, &env_map, &https_proxy_env_var_names)) |proxy| {
-        return proxy;
+fn getProxyFromProcess(allocator: Allocator, env_vars: []const []const u8) !?[]const u8 {
+    const override = blk: {
+        proxy_override_mutex.lock();
+        defer proxy_override_mutex.unlock();
+        if (proxy_override_value) |value| break :blk try allocator.dupe(u8, value);
+        break :blk null;
+    };
+    if (override) |value| return value;
+    for (env_vars) |key| {
+        const raw = std_compat.process.getEnvVarOwned(allocator, key) catch continue;
+        defer allocator.free(raw);
+        if (try normalizeProxyEnvValue(allocator, raw)) |value| return value;
     }
-    return try getProxyFromEnvMap(allocator, &env_map, &http_proxy_env_var_names);
+    return null;
 }
 
-/// HTTP GET via curl for SSE (Server-Sent Events).
-///
-/// Uses -N (--no-buffer) to disable output buffering, allowing
-/// SSE events to be received in real-time. Also sends Accept: text/event-stream.
-pub fn curlGetSSE(
-    allocator: Allocator,
-    url: []const u8,
-    timeout_secs: []const u8,
-) ![]u8 {
-    try validateNoCredentialedCurlArgs(url, &.{});
-    var argv_buf: [40][]const u8 = undefined;
-    var argc: usize = 0;
+pub fn getProxyFromEnv(allocator: Allocator) !?[]const u8 {
+    return getProxyFromProcess(allocator, &(https_proxy_env_var_names ++ http_proxy_env_var_names));
+}
 
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-sf";
-    argc += 1;
-    argv_buf[argc] = "-N";
-    argc += 1;
-    argv_buf[argc] = "--max-time";
-    argc += 1;
-    argv_buf[argc] = timeout_secs;
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Accept: text/event-stream";
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
+fn proxyEnvNamesForUrl(url: []const u8) ![]const []const u8 {
+    const uri = std.Uri.parse(url) catch return error.InvalidUrl;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return &https_proxy_env_var_names;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) return &http_proxy_env_var_names;
+    return error.InvalidUrl;
+}
 
-    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    child.spawn() catch |err| {
-        log.err("curl GET-SSE spawn failed: {}", .{err});
-        return error.CurlFailed;
-    };
-    const cancel_flag = thread_interrupt_flag;
-    var cancel_done = AtomicBool.init(false);
-    var cancel_watcher: ?std.Thread = null;
-    var watcher_ctx: CancelWatcherCtx = undefined;
-    if (cancel_flag) |flag| {
-        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
-        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
-    }
-    defer {
-        cancel_done.store(true, .release);
-        if (cancel_watcher) |t| t.join();
-    }
-    var stderr_capture = StderrCapture{};
-    var stderr_thread = startStderrCapture(&child, &stderr_capture);
-    defer if (stderr_thread) |thread| thread.join();
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
-    };
-
-    const term = child.wait() catch |err| {
-        _ = child.kill() catch {};
-        const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
-        logCurlWaitFailure("GET-SSE", err, stderr_msg);
-        allocator.free(stdout);
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
-    };
-    const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
-    switch (term) {
-        .exited => |code| {
-            if (code != 0) {
-                // Exit code 28 = timeout. This is expected for SSE when no data arrives,
-                // but curl may have received some data before timing out - return it.
-                // For other exit codes, treat as error.
-                if (code != 28) {
-                    logCurlExitFailure("GET-SSE", code, stderr_msg);
-                    allocator.free(stdout);
-                    return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
-                }
-                // Timeout (code 28) - return any data we received
-            }
-        },
-        else => {
-            allocator.free(stdout);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
-        },
-    }
-
-    return stdout;
+pub fn getProxyForUrl(allocator: Allocator, url: []const u8) !?[]const u8 {
+    return getProxyFromProcess(allocator, try proxyEnvNamesForUrl(url));
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
 
-test "curlPostWithProxy header guard allows at most (argv_buf_len - base_args) / 2 headers" {
-    // argv_buf is [40][]const u8. Base args consume 8 slots (curl -s -X POST -H
-    // Content-Type --data-binary @- url), leaving 32 slots = 16 header pairs.
-    // The guard `argc + 2 > argv_buf.len` stops additions before overflow.
-    // We verify the guard constant is consistent: remaining = 40 - 8 = 32, max headers = 16.
-    const argv_buf_len = 40;
-    const base_args = 8; // curl -s -X POST -H <ct> --data-binary @- <url>
-    const max_header_pairs = (argv_buf_len - base_args) / 2;
-    try std.testing.expectEqual(@as(usize, 16), max_header_pairs);
-}
-
-test "curlPostWithStatus compiles and is callable" {
-    try std.testing.expect(true);
-}
-
-test "curlGetWithStatus compiles and is callable" {
-    try std.testing.expect(true);
-}
-
-test "curlPut compiles and is callable" {
-    try std.testing.expect(true);
-}
-
-test "curlPostForm uses exactly 9 fixed args plus url" {
-    // argv_buf is [10][]const u8: curl -s -X POST -H <ct> --data-binary @- <url> = 9 slots.
-    // Verify the constant is consistent with the implementation.
-    const argv_buf_len = 10;
-    const fixed_args = 9; // curl -s -X POST -H Content-Type --data-binary @- (url)
-    try std.testing.expect(fixed_args < argv_buf_len);
-}
-
-test "curlGet with zero headers compiles and is callable" {
-    // Smoke-test: verifies the function signature is reachable and the arg-building
-    // path with an empty header slice does not panic at comptime.
-    _ = curlGet;
-}
-
-test "curlGetWithResolve compiles and is callable" {
-    try std.testing.expect(true);
-}
-
-test "curlGetMaxBytes compiles and is callable" {
-    _ = curlGetMaxBytes;
-}
-
-test "credentialed curl argv validation rejects authorization header" {
-    try std.testing.expectError(
-        error.CredentialedCurlArgRejected,
-        validateNoCredentialedCurlArgs("https://example.com/v1", &.{"Authorization: Bearer test-token"}),
-    );
-}
-
-test "credentialed curl argv validation rejects token query" {
-    try std.testing.expectError(
-        error.CredentialedCurlArgRejected,
-        validateNoCredentialedCurlArgs("https://example.com/v1?access_token=test-token", &.{}),
-    );
-}
-
-test "credentialed curl args route to std http fallback" {
-    try std.testing.expect(hasCredentialedCurlArgs("https://example.com/v1", &.{"Authorization: Bearer test-token"}));
-    try std.testing.expect(hasCredentialedCurlArgs("https://example.com/v1?access_token=test-token", &.{}));
-    try std.testing.expect(!hasCredentialedCurlArgs("https://example.com/v1", &.{"User-Agent: nullclaw-test"}));
-}
-
-const LegacyCredentialedCurlHelper = enum {
+const CredentialedNativeHelper = enum {
     get_body,
     get_status,
     post_body,
@@ -1689,7 +790,7 @@ const LegacyCredentialedCurlHelper = enum {
     put_body,
 };
 
-const CredentialedCurlFallbackServerCtx = struct {
+const CredentialedNativeServerCtx = struct {
     server: *std_compat.net.Server,
     expected_method: []const u8,
     saw_request: AtomicBool = AtomicBool.init(false),
@@ -1697,7 +798,7 @@ const CredentialedCurlFallbackServerCtx = struct {
     saw_authorization: AtomicBool = AtomicBool.init(false),
 };
 
-fn serveCredentialedCurlFallbackTest(ctx: *CredentialedCurlFallbackServerCtx) void {
+fn serveCredentialedNativeTest(ctx: *CredentialedNativeServerCtx) void {
     var conn = ctx.server.accept() catch return;
     defer conn.stream.close();
 
@@ -1732,12 +833,12 @@ fn serveCredentialedCurlFallbackTest(ctx: *CredentialedCurlFallbackServerCtx) vo
     conn.stream.writeAll(response) catch {};
 }
 
-fn unblockCredentialedCurlFallbackServer(server: *std_compat.net.Server) void {
+fn unblockCredentialedNativeServer(server: *std_compat.net.Server) void {
     var conn = std_compat.net.tcpConnectToAddress(server.listen_address) catch return;
     conn.close();
 }
 
-fn expectLegacyCredentialedCurlFallback(helper: LegacyCredentialedCurlHelper, expected_method: []const u8) !void {
+fn expectCredentialedNative(helper: CredentialedNativeHelper, expected_method: []const u8) !void {
     if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -1745,11 +846,11 @@ fn expectLegacyCredentialedCurlFallback(helper: LegacyCredentialedCurlHelper, ex
     var server = try addr.listen(.{});
     defer server.deinit();
 
-    var ctx = CredentialedCurlFallbackServerCtx{
+    var ctx = CredentialedNativeServerCtx{
         .server = &server,
         .expected_method = expected_method,
     };
-    var thread = try std.Thread.spawn(.{}, serveCredentialedCurlFallbackTest, .{&ctx});
+    var thread = try std.Thread.spawn(.{}, serveCredentialedNativeTest, .{&ctx});
 
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/legacy", .{server.listen_address.in.getPort()});
     defer allocator.free(url);
@@ -1824,7 +925,7 @@ fn expectLegacyCredentialedCurlFallback(helper: LegacyCredentialedCurlHelper, ex
     }
 
     if (!ctx.saw_request.load(.acquire)) {
-        unblockCredentialedCurlFallbackServer(&server);
+        unblockCredentialedNativeServer(&server);
     }
     thread.join();
 
@@ -1833,7 +934,7 @@ fn expectLegacyCredentialedCurlFallback(helper: LegacyCredentialedCurlHelper, ex
     try std.testing.expect(ctx.saw_authorization.load(.acquire));
 }
 
-fn expectCredentialedCurlResolveEntry(helper: LegacyCredentialedCurlHelper, expected_method: []const u8) !void {
+fn expectCredentialedResolveEntry(helper: CredentialedNativeHelper, expected_method: []const u8) !void {
     if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -1841,11 +942,11 @@ fn expectCredentialedCurlResolveEntry(helper: LegacyCredentialedCurlHelper, expe
     var server = try addr.listen(.{});
     defer server.deinit();
 
-    var ctx = CredentialedCurlFallbackServerCtx{
+    var ctx = CredentialedNativeServerCtx{
         .server = &server,
         .expected_method = expected_method,
     };
-    var thread = try std.Thread.spawn(.{}, serveCredentialedCurlFallbackTest, .{&ctx});
+    var thread = try std.Thread.spawn(.{}, serveCredentialedNativeTest, .{&ctx});
 
     const host = "credentialed-curl.test";
     const port = server.listen_address.in.getPort();
@@ -1915,7 +1016,7 @@ fn expectCredentialedCurlResolveEntry(helper: LegacyCredentialedCurlHelper, expe
     }
 
     if (!ctx.saw_request.load(.acquire)) {
-        unblockCredentialedCurlFallbackServer(&server);
+        unblockCredentialedNativeServer(&server);
     }
     thread.join();
 
@@ -1924,81 +1025,41 @@ fn expectCredentialedCurlResolveEntry(helper: LegacyCredentialedCurlHelper, expe
     try std.testing.expect(ctx.saw_authorization.load(.acquire));
 }
 
-test "credentialed legacy curl body helpers do not reject authorization headers" {
-    // Regression: legacy channel code still passes Authorization to curl* helper
-    // APIs. These helpers must route through std.http fallback instead of
-    // returning CredentialedCurlArgRejected and breaking old channels.
-    try expectLegacyCredentialedCurlFallback(.get_body, "GET");
-    try expectLegacyCredentialedCurlFallback(.post_body, "POST");
-    try expectLegacyCredentialedCurlFallback(.put_body, "PUT");
+test "credentialed native body helpers do not reject authorization headers" {
+    // Channel callers retain their headers when using native HTTP.
+    try expectCredentialedNative(.get_body, "GET");
+    try expectCredentialedNative(.post_body, "POST");
+    try expectCredentialedNative(.put_body, "PUT");
 }
 
-test "credentialed legacy curl status helpers do not reject authorization headers" {
+test "credentialed native status helpers do not reject authorization headers" {
     // Regression: status-returning helpers used by Lark/QQ/OneBot must preserve
-    // behavior while keeping Authorization out of curl argv.
-    try expectLegacyCredentialedCurlFallback(.get_status, "GET");
-    try expectLegacyCredentialedCurlFallback(.post_status, "POST");
-    try expectLegacyCredentialedCurlFallback(.post_status_headers, "POST");
+    // behavior through the in-process transport.
+    try expectCredentialedNative(.get_status, "GET");
+    try expectCredentialedNative(.post_status, "POST");
+    try expectCredentialedNative(.post_status_headers, "POST");
 }
 
 test "credentialed curl helpers preserve resolve pinning" {
-    // Regression: credentialed fallback must not bypass curl --resolve pinning,
-    // otherwise provider SSRF/DNS-rebinding protection is weakened.
-    try expectCredentialedCurlResolveEntry(.get_body, "GET");
-    try expectCredentialedCurlResolveEntry(.post_body, "POST");
-    try expectCredentialedCurlResolveEntry(.get_status, "GET");
-    try expectCredentialedCurlResolveEntry(.post_status, "POST");
-    try expectCredentialedCurlResolveEntry(.post_status_headers, "POST");
+    // Native requests retain the validated address pin.
+    try expectCredentialedResolveEntry(.get_body, "GET");
+    try expectCredentialedResolveEntry(.post_body, "POST");
+    try expectCredentialedResolveEntry(.get_status, "GET");
+    try expectCredentialedResolveEntry(.post_status, "POST");
+    try expectCredentialedResolveEntry(.post_status_headers, "POST");
 }
 
-test "credentialed curl resolve path rejects sensitive URL tokens" {
+test "native request rejects injected URL headers before network access" {
     try std.testing.expectError(
-        error.CredentialedCurlArgRejected,
+        error.InvalidHeader,
         curlGetWithResolve(
             std.testing.allocator,
-            "https://example.com/v1?access_token=test-token",
+            "https://example.com/v1\r\nX-Injected: value",
             &.{},
             "5",
             "example.com:443:203.0.113.10",
         ),
     );
-}
-
-test "prepareCurlHeaderArg writes headers outside argv" {
-    var prepared = try prepareCurlHeaderArg(std.testing.allocator, &.{ "Authorization: Bearer test-token", "X-Test: ok" });
-    defer prepared.deinit(std.testing.allocator);
-
-    // Regression: direct curl callers can keep credential headers out of argv.
-    try std.testing.expect(prepared.uses_temp_file);
-    try std.testing.expect(prepared.arg != null);
-    try std.testing.expect(std.mem.startsWith(u8, prepared.arg.?, "@"));
-
-    const file = try std_compat.fs.openFileAbsolute(prepared.arg.?[1..], .{});
-    defer file.close();
-    const content = try file.readToEndAlloc(std.testing.allocator, 1024);
-    defer std.testing.allocator.free(content);
-    try std.testing.expectEqualStrings("Authorization: Bearer test-token\nX-Test: ok\n", content);
-}
-
-test "prepareCurlHeaderArg rejects newline injection" {
-    try std.testing.expectError(
-        error.InvalidHeader,
-        prepareCurlHeaderArg(std.testing.allocator, &.{"Authorization: Bearer test-token\nX-Injected: bad"}),
-    );
-}
-
-test "credentialed curl argv validation permits non-secret headers" {
-    try validateNoCredentialedCurlArgs("https://example.com/v1", &.{"User-Agent: nullclaw-test"});
-}
-
-test "remote credentialed request takes the pinned curl path, not the std.http fallback" {
-    // DNS-rebinding TOCTOU guard: a remote credentialed dial (non-null resolve pin)
-    // must NOT fall back to std.http — that path re-resolves the host at connect and
-    // discards the validated address. The fallback is reserved for an explicit local
-    // host (null pin), which carries no rebinding risk.
-    const auth = [_][]const u8{"Authorization: Bearer sk-test-not-real"};
-    try std.testing.expect(!credentialedCurlUsesHttpFallback("https://api.example.com/v1", &auth, "api.example.com:443:203.0.113.7"));
-    try std.testing.expect(credentialedCurlUsesHttpFallback("http://127.0.0.1:11434/v1", &auth, null));
 }
 
 test "buildSafeResolveEntryForRemoteUrl allows explicit local host without pinning" {
@@ -2010,8 +1071,7 @@ test "buildSafeResolveEntryForRemoteUrl rejects loopback integer alias" {
 }
 
 test "buildSafeResolveEntryForRemoteUrl maps resolution failure to fail closed" {
-    // Regression: do not silently fall back to curl DNS on resolver failure,
-    // because that bypasses private-address screening before --resolve pinning.
+    // Resolver failure must not bypass private-address screening.
     try std.testing.expect(mapResolveConnectHostError("example.com", error.HostResolutionFailed) == error.HostResolutionFailed);
 }
 
@@ -2019,42 +1079,8 @@ test "buildSafeResolveEntryForRemoteUrl rejects malformed URL" {
     try std.testing.expectError(error.InvalidUrl, buildSafeResolveEntryForRemoteUrl(std.testing.allocator, "notaurl"));
 }
 
-test "appendCurlResolveArgs forces pinned requests past environment proxies" {
-    var argv_buf: [4][]const u8 = undefined;
-    var argc: usize = 0;
-    appendCurlResolveArgs(argv_buf[0..], &argc, "example.com:443:203.0.113.7");
-    try std.testing.expectEqual(@as(usize, 4), argc);
-    try std.testing.expectEqualStrings("--noproxy", argv_buf[0]);
-    try std.testing.expectEqualStrings("*", argv_buf[1]);
-    try std.testing.expectEqualStrings("--resolve", argv_buf[2]);
-    try std.testing.expectEqualStrings("example.com:443:203.0.113.7", argv_buf[3]);
-}
-
-test "appendCurlResolveArgs skips null entry" {
-    var argv_buf: [2][]const u8 = undefined;
-    var argc: usize = 0;
-    appendCurlResolveArgs(argv_buf[0..], &argc, null);
-    try std.testing.expectEqual(@as(usize, 0), argc);
-}
-
 test "curl post max bytes is increased for large provider responses" {
     try std.testing.expect(DEFAULT_CURL_POST_MAX_BYTES >= 8 * 1024 * 1024);
-}
-
-test "curl exit code classification maps key network classes" {
-    try std.testing.expectEqualStrings("dns", classifyCurlExitCode(6));
-    try std.testing.expectEqualStrings("connect", classifyCurlExitCode(7));
-    try std.testing.expectEqualStrings("timeout", classifyCurlExitCode(28));
-    try std.testing.expectEqualStrings("tls", classifyCurlExitCode(60));
-    try std.testing.expectEqualStrings("other", classifyCurlExitCode(22));
-}
-
-test "curl exit code mapping returns specific errors" {
-    try std.testing.expect(mapCurlExitCodeToError(6) == error.CurlDnsError);
-    try std.testing.expect(mapCurlExitCodeToError(7) == error.CurlConnectError);
-    try std.testing.expect(mapCurlExitCodeToError(28) == error.CurlTimeout);
-    try std.testing.expect(mapCurlExitCodeToError(60) == error.CurlTlsError);
-    try std.testing.expect(mapCurlExitCodeToError(22) == error.CurlFailed);
 }
 
 test "preserveCurlTransportError preserves curl transport failures" {
@@ -2074,24 +1100,6 @@ test "preserveCurlTransportError preserves curl transport failures" {
 test "preserveCurlTransportError returns fallback for non-transport failures" {
     try std.testing.expect(preserveCurlTransportError(error.RateLimited, error.ApiError) == error.ApiError);
     try std.testing.expect(preserveCurlTransportError(error.InvalidUrl, error.ApiError) == error.ApiError);
-}
-
-test "StderrCapture returns trimmed stderr" {
-    var capture = StderrCapture{};
-    const raw = "\n curl: (6) Could not resolve host \n";
-    @memcpy(capture.buffer[0..raw.len], raw);
-    capture.len = raw.len;
-
-    try std.testing.expectEqualStrings("curl: (6) Could not resolve host", capture.trimmed().?);
-}
-
-test "StderrCapture ignores empty stderr" {
-    var capture = StderrCapture{};
-    const raw = " \n\t ";
-    @memcpy(capture.buffer[0..raw.len], raw);
-    capture.len = raw.len;
-
-    try std.testing.expect(capture.trimmed() == null);
 }
 
 test "normalizeProxyEnvValue trims surrounding whitespace" {
@@ -2126,6 +1134,61 @@ test "setProxyOverride applies and clears process-wide override" {
     }
 }
 
+test "buffered request with a DNS pin uses the configured proxy" {
+    // Regression: a null explicit proxy disabled the environment override for
+    // pinned provider calls, so they dialed outside the configured proxy.
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const address = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try address.listen(.{});
+    defer server.deinit();
+    const Proxy = struct {
+        server: *std_compat.net.Server,
+        saw_pin: AtomicBool = AtomicBool.init(false),
+
+        fn readHeaders(stream: std_compat.net.Stream, buf: *[4096]u8) ![]const u8 {
+            var used: usize = 0;
+            while (used < buf.len) {
+                const count = try stream.read(buf[used..]);
+                if (count == 0) return error.TestUnexpectedResult;
+                used += count;
+                if (std.mem.indexOf(u8, buf[0..used], "\r\n\r\n") != null) return buf[0..used];
+            }
+            return error.TestUnexpectedResult;
+        }
+
+        fn run(self: *@This()) void {
+            var connection = self.server.accept() catch return;
+            defer connection.stream.close();
+            var first: [4096]u8 = undefined;
+            const connect = readHeaders(connection.stream, &first) catch return;
+            if (!std.mem.startsWith(u8, connect, "CONNECT 203.0.113.9:80 ")) return;
+            self.saw_pin.store(true, .release);
+            connection.stream.writeAll("HTTP/1.1 200 Connection established\r\n\r\n") catch return;
+            var second: [4096]u8 = undefined;
+            _ = readHeaders(connection.stream, &second) catch return;
+            connection.stream.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok") catch {};
+        }
+    };
+    var proxy_server = Proxy{ .server = &server };
+    var thread = try std.Thread.spawn(.{}, Proxy.run, .{&proxy_server});
+    var joined = false;
+    defer if (!joined) {
+        unblockCredentialedNativeServer(&server);
+        thread.join();
+    };
+    const proxy_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{server.listen_address.in.getPort()});
+    defer allocator.free(proxy_url);
+    try setProxyOverride(proxy_url);
+    defer setProxyOverride(null) catch unreachable;
+    const body = try curlGetWithResolve(allocator, "http://pinned.test:80/", &.{}, "5", "pinned.test:80:203.0.113.9");
+    defer allocator.free(body);
+    thread.join();
+    joined = true;
+    try std.testing.expectEqualStrings("ok", body);
+    try std.testing.expect(proxy_server.saw_pin.load(.acquire));
+}
+
 test "setProxyOverride accepts long proxy URLs" {
     const allocator = std.testing.allocator;
     var long_proxy = try allocator.alloc(u8, 1600);
@@ -2155,6 +1218,32 @@ test "getProxyFromEnvMap honors lowercase https_proxy before http_proxy" {
 
     try std.testing.expect(proxy != null);
     try std.testing.expectEqualStrings("https://secure.example:8443", proxy.?);
+}
+
+test "proxy lookup selects HTTP and HTTPS environment variables by URL" {
+    var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("http_proxy", "http://http-proxy.example:8080");
+    try env_map.put("https_proxy", "http://https-proxy.example:8443");
+    try env_map.put("all_proxy", "http://fallback-proxy.example:8888");
+    const http = try getProxyFromEnvMap(std.testing.allocator, &env_map, try proxyEnvNamesForUrl("http://example.com/"));
+    defer if (http) |value| std.testing.allocator.free(value);
+    const https = try getProxyFromEnvMap(std.testing.allocator, &env_map, try proxyEnvNamesForUrl("https://example.com/"));
+    defer if (https) |value| std.testing.allocator.free(value);
+    try std.testing.expectEqualStrings("http://http-proxy.example:8080", http.?);
+    try std.testing.expectEqualStrings("http://https-proxy.example:8443", https.?);
+    try std.testing.expectError(error.InvalidUrl, proxyEnvNamesForUrl("ftp://example.com/"));
+}
+
+test "HTTP proxy lookup ignores uppercase HTTP_PROXY" {
+    // CGI can place a request header in HTTP_PROXY; libcurl intentionally
+    // ignores that environment variable for HTTP requests.
+    var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("HTTP_PROXY", "http://untrusted.example:8080");
+    const proxy = try getProxyFromEnvMap(std.testing.allocator, &env_map, try proxyEnvNamesForUrl("http://example.com/"));
+    defer if (proxy) |value| std.testing.allocator.free(value);
+    try std.testing.expect(proxy == null);
 }
 
 test "applyProxyOverrideToEnvMap overwrites existing proxy values" {

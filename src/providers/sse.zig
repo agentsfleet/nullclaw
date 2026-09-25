@@ -1,112 +1,74 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const root = @import("root.zig");
-const http_util = @import("../http_util.zig");
 const error_classify = @import("error_classify.zig");
 const verbose = @import("../verbose.zig");
+const stream_tools = @import("sse_tool_calls.zig");
+const native_sse = @import("native_sse.zig");
 const log = std.log.scoped(.provider_sse);
 
-var curl_fail_fast_arg_mutex: std_compat.sync.Mutex = .{};
-var curl_fail_with_body_supported_cache: ?bool = null;
-const stream_stall_detection_args = [_][]const u8{
-    "--speed-limit",
-    "1",
-    "--speed-time",
-    "60",
-};
+const MAX_STREAM_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
-fn finalizeStreamResult(
+pub fn appendStreamOutput(allocator: std.mem.Allocator, output: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
+    if (bytes.len > MAX_STREAM_OUTPUT_BYTES - output.items.len) return error.StreamOutputTooLarge;
+    try output.appendSlice(allocator, bytes);
+}
+
+fn finalizeStreamResultWithTools(
     allocator: std.mem.Allocator,
-    accumulated: []const u8,
+    accumulated: *std.ArrayListUnmanaged(u8),
     stream_usage: ?root.TokenUsage,
+    collector: *stream_tools.Collector,
+    allow_tool_calls: bool,
 ) !root.StreamChatResult {
     var content: ?[]const u8 = null;
     var reasoning_content: ?[]const u8 = null;
-    if (accumulated.len > 0) {
-        const split = try root.splitThinkContent(allocator, accumulated);
-        content = split.visible;
-        reasoning_content = split.reasoning;
+    const output_len = accumulated.items.len;
+    if (output_len > 0) {
+        if (std.mem.indexOf(u8, accumulated.items, "<think>") == null and
+            std.mem.indexOf(u8, accumulated.items, "</think>") == null)
+        {
+            content = try accumulated.toOwnedSlice(allocator);
+        } else {
+            const split = try root.splitThinkContent(allocator, accumulated.items);
+            content = split.visible;
+            reasoning_content = split.reasoning;
+        }
+    }
+    errdefer {
+        if (content) |text| allocator.free(text);
+        if (reasoning_content) |text| allocator.free(text);
     }
 
     var usage = stream_usage orelse root.TokenUsage{};
     if (usage.completion_tokens == 0) {
-        usage.completion_tokens = @intCast((accumulated.len + 3) / 4);
+        usage.completion_tokens = @intCast((output_len + 3) / 4);
     }
 
+    const tool_calls = if (allow_tool_calls) try collector.take(allocator) else &.{};
     return .{
         .content = content,
         .reasoning_content = reasoning_content,
+        .tool_calls = tool_calls,
         .usage = usage,
         .model = "",
+        .finish_reason = collector.finish_reason,
+        .tool_fragments = collector.fragments,
     };
 }
 
-fn parseCurlVersionComponent(component: []const u8) ?u32 {
-    var end: usize = 0;
-    while (end < component.len and std.ascii.isDigit(component[end])) : (end += 1) {}
-    if (end == 0) return null;
-    return std.fmt.parseInt(u32, component[0..end], 10) catch null;
+fn finalizeStreamResult(
+    allocator: std.mem.Allocator,
+    accumulated: *std.ArrayListUnmanaged(u8),
+    stream_usage: ?root.TokenUsage,
+) !root.StreamChatResult {
+    var collector = stream_tools.Collector{};
+    return finalizeStreamResultWithTools(allocator, accumulated, stream_usage, &collector, false);
 }
 
-fn parseCurlVersionTriplet(version_line: []const u8) ?[3]u32 {
-    const prefix = "curl ";
-    if (!std.mem.startsWith(u8, version_line, prefix)) return null;
-
-    const version_tail = version_line[prefix.len..];
-    const version_end = std.mem.indexOfScalar(u8, version_tail, ' ') orelse version_tail.len;
-    const version_token = version_tail[0..version_end];
-
-    var parts = std.mem.splitScalar(u8, version_token, '.');
-    const major = parseCurlVersionComponent(parts.next() orelse return null) orelse return null;
-    const minor = parseCurlVersionComponent(parts.next() orelse return null) orelse return null;
-    const patch = parseCurlVersionComponent(parts.next() orelse return null) orelse return null;
-    return .{ major, minor, patch };
-}
-
-fn curlVersionSupportsFailWithBody(version_line: []const u8) bool {
-    const version = parseCurlVersionTriplet(version_line) orelse return false;
-    if (version[0] != 7) return version[0] > 7;
-    if (version[1] != 76) return version[1] > 76;
-    return version[2] >= 0;
-}
-
-fn detectCurlFailWithBodySupport(allocator: std.mem.Allocator) bool {
-    const result = std_compat.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "curl", "--version" },
-        .max_output_bytes = 1024,
-    }) catch return false;
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    switch (result.term) {
-        .exited => |code| if (code != 0) return false,
-        else => return false,
-    }
-
-    const trimmed = std.mem.trim(u8, result.stdout, " \n\r\t");
-    var line_it = std.mem.splitScalar(u8, trimmed, '\n');
-    return curlVersionSupportsFailWithBody(line_it.first());
-}
-
-/// Prefer `--fail-with-body` so JSON API errors remain classifiable, but fall
-/// back to `-f` on curl releases older than 7.76.0 where the newer flag fails.
-pub fn curlFailFastArg(allocator: std.mem.Allocator) []const u8 {
-    curl_fail_fast_arg_mutex.lock();
-    defer curl_fail_fast_arg_mutex.unlock();
-
-    if (curl_fail_with_body_supported_cache == null) {
-        curl_fail_with_body_supported_cache = detectCurlFailWithBodySupport(allocator);
-    }
-
-    return if (curl_fail_with_body_supported_cache.?) "--fail-with-body" else "-f";
-}
-
-pub fn appendCurlStallDetectionArgs(argv_buf: [][]const u8, argc: *usize) void {
-    for (stream_stall_detection_args) |arg| {
-        argv_buf[argc.*] = arg;
-        argc.* += 1;
-    }
+fn validateToolFinish(collector: *const stream_tools.Collector) !void {
+    if (collector.count > 0 and collector.finish_reason != .tool_calls)
+        return error.IncompleteStreamToolCall;
 }
 
 /// Content delta from an SSE chunk.
@@ -146,7 +108,7 @@ fn closeReasoningBlock(
 ) !void {
     if (!in_reasoning.*) return;
     in_reasoning.* = false;
-    try accumulated.appendSlice(allocator, THINK_CLOSE_TAG);
+    try appendStreamOutput(allocator, accumulated, THINK_CLOSE_TAG);
     callback(ctx, root.StreamChunk.textDelta(THINK_CLOSE_TAG));
 }
 
@@ -161,17 +123,17 @@ fn appendDeltaContent(
     switch (content) {
         .text => |text| {
             try closeReasoningBlock(allocator, accumulated, in_reasoning, callback, ctx);
-            try accumulated.appendSlice(allocator, text);
-            callback(ctx, root.StreamChunk.textDelta(text));
+            try appendStreamOutput(allocator, accumulated, text);
+            callback(ctx, root.StreamChunk.answerDelta(text));
         },
         .reasoning => |reasoning| {
             if (!in_reasoning.*) {
                 in_reasoning.* = true;
-                try accumulated.appendSlice(allocator, THINK_OPEN_TAG);
+                try appendStreamOutput(allocator, accumulated, THINK_OPEN_TAG);
                 callback(ctx, root.StreamChunk.textDelta(THINK_OPEN_TAG));
             }
-            try accumulated.appendSlice(allocator, reasoning);
-            callback(ctx, root.StreamChunk.textDelta(reasoning));
+            try appendStreamOutput(allocator, accumulated, reasoning);
+            callback(ctx, root.StreamChunk.reasoningDelta(reasoning));
         },
     }
 }
@@ -183,30 +145,39 @@ fn appendDeltaContent(
 /// - `data: {JSON}` → extracts `choices[0].delta.content` → `.delta`
 /// - Empty lines, comments (`:`) → `.skip`
 pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResult {
-    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
+    return parseSseLineWithTools(allocator, line, null);
+}
 
-    if (trimmed.len == 0) return .skip;
-    if (trimmed[0] == ':') return .skip;
-
-    // SSE uses "data:" with an optional single leading space before the value.
-    const prefix = "data:";
-    if (!std.mem.startsWith(u8, trimmed, prefix)) return .skip;
-
-    const data = if (trimmed.len > prefix.len and trimmed[prefix.len] == ' ')
-        trimmed[prefix.len + 1 ..]
-    else
-        trimmed[prefix.len..];
-
+fn parseSseLineWithTools(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    collector: ?*stream_tools.Collector,
+) !SseLineResult {
+    const data = openAiDataPayload(line) orelse return .skip;
     if (data.len == 0) return .skip;
 
     if (std.mem.eql(u8, data, "[DONE]")) return .done;
 
-    const content = try extractDeltaContent(allocator, data) orelse {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidSseJson;
+    };
+    defer parsed.deinit();
+    if (collector) |tools| try tools.feedValue(allocator, parsed.value);
+
+    const content = try extractDeltaContentValue(allocator, parsed.value) orelse {
         // No content delta — check for usage data (sent in the final chunk).
-        if (extractStreamUsage(data)) |u| return .{ .usage = u };
+        if (extractStreamUsageValue(parsed.value)) |u| return .{ .usage = u };
         return .skip;
     };
     return .{ .delta = content };
+}
+
+fn openAiDataPayload(line: []const u8) ?[]const u8 {
+    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
+    if (!std.mem.startsWith(u8, trimmed, "data:")) return null;
+    const value = trimmed[5..];
+    return if (std.mem.startsWith(u8, value, " ")) value[1..] else value;
 }
 
 /// Extract `usage` object from an OpenAI-compatible streaming chunk.
@@ -223,8 +194,12 @@ fn extractStreamUsage(json_str: []const u8) ?root.TokenUsage {
         return null;
     defer parsed.deinit();
 
-    if (parsed.value != .object) return null;
-    const obj = parsed.value.object;
+    return extractStreamUsageValue(parsed.value);
+}
+
+fn extractStreamUsageValue(value: std.json.Value) ?root.TokenUsage {
+    if (value != .object) return null;
+    const obj = value.object;
     const usage_val = obj.get("usage") orelse return null;
     if (usage_val != .object) return null;
 
@@ -281,11 +256,17 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch |err| {
         if (verbose.isVerbose()) log.err("Failed to parse SSE JSON payload: len={d} error={s}", .{ json_str.len, @errorName(err) });
+        if (err == error.OutOfMemory) return err;
         return error.InvalidSseJson;
     };
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
+    return extractDeltaContentValue(allocator, parsed.value);
+}
+
+fn extractDeltaContentValue(allocator: std.mem.Allocator, value: std.json.Value) !?DeltaContent {
+    if (value != .object) return null;
+    const obj = value.object;
     const choices = obj.get("choices") orelse return null;
     if (choices != .array or choices.array.items.len == 0) return null;
 
@@ -329,9 +310,8 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
 /// exist from a rejected credential — `error_classify` collapses both into the
 /// same bucket — which is exactly the difference an operator needs.
 ///
-/// Best-effort by construction: it runs while an error is already returning,
-/// so a scrub allocation failure falls back to the unscrubbed summary rather
-/// than replacing the caller's error.
+/// Best-effort by construction: a scrub allocation failure records only the
+/// mapped error name, never upstream text that may echo credentials.
 fn recordStreamApiErrorDetail(
     allocator: std.mem.Allocator,
     root_obj: std.json.ObjectMap,
@@ -341,7 +321,7 @@ fn recordStreamApiErrorDetail(
     const summary = error_classify.summarizeKnownApiError(root_obj, &summary_buf) orelse @errorName(mapped_err);
     const sanitized = root.sanitizeApiError(allocator, summary) catch null;
     defer if (sanitized) |s| allocator.free(s);
-    root.setLastApiErrorDetail("", sanitized orelse summary);
+    root.setLastApiErrorDetail("", sanitized orelse @errorName(mapped_err));
 }
 
 /// Record an error payload that is JSON but not a shape `error_classify`
@@ -353,12 +333,103 @@ fn recordStreamApiErrorBody(allocator: std.mem.Allocator, body: []const u8) void
     root.setLastApiErrorDetail("", sanitized);
 }
 
-/// Run curl in SSE streaming mode and parse output line by line.
-///
-/// Spawns `curl -s --no-buffer` with the strongest supported fail-fast flag:
-/// `--fail-with-body` on curl >= 7.76.0, otherwise `-f`.
-/// For each SSE delta, calls `callback(ctx, chunk)`.
-/// Returns accumulated result after stream completes.
+/// Classify and scrub an initial JSON provider error shared by SSE dialects.
+pub fn initialJsonError(allocator: std.mem.Allocator, line: []const u8) ?anyerror {
+    if (!std.mem.startsWith(u8, line, "{")) return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch null;
+    if (parsed) |payload| {
+        defer payload.deinit();
+        if (payload.value == .object) {
+            if (error_classify.classifyKnownApiError(payload.value.object)) |kind| {
+                const mapped = error_classify.kindToError(kind);
+                recordStreamApiErrorDetail(allocator, payload.value.object, mapped);
+                return mapped;
+            }
+        }
+    }
+    recordStreamApiErrorBody(allocator, line);
+    return error.ServerError;
+}
+
+const OpenAiStream = struct {
+    allocator: std.mem.Allocator,
+    callback: root.StreamCallback,
+    ctx: *anyopaque,
+    accumulated: std.ArrayListUnmanaged(u8) = .empty,
+    usage: ?root.TokenUsage = null,
+    in_reasoning: bool = false,
+    tools: stream_tools.Collector = .{},
+    metadata_error: ?anyerror = null,
+    first_line: bool = true,
+    saw_done: bool = false,
+
+    fn deinit(self: *OpenAiStream) void {
+        self.accumulated.deinit(self.allocator);
+        self.tools.deinit(self.allocator);
+    }
+
+    fn onLine(context: *anyopaque, line: []const u8) anyerror!bool {
+        const self: *OpenAiStream = @ptrCast(@alignCast(context));
+        if (self.first_line) if (initialJsonError(self.allocator, line)) |err| return err;
+        self.first_line = false;
+        const result = parseSseLineWithTools(self.allocator, line, if (self.metadata_error == null) &self.tools else null) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            // Plain-text provider heartbeats can be skipped before tool
+            // assembly. A malformed JSON object might be a tool argument
+            // fragment, so it must fail the turn rather than alter a call.
+            if (err == error.InvalidSseJson and self.tools.count == 0) {
+                if (openAiDataPayload(line)) |data| {
+                    if (data.len > 0 and data[0] != '{' and data[0] != '[') return true;
+                }
+            }
+            if (self.metadata_error == null) self.metadata_error = err;
+            return true;
+        };
+        switch (result) {
+            .delta => |content| {
+                defer content.deinit(self.allocator);
+                try appendDeltaContent(self.allocator, &self.accumulated, &self.in_reasoning, self.callback, self.ctx, content);
+            },
+            .usage => |usage| self.usage = usage,
+            .done => {
+                self.saw_done = true;
+                return false;
+            },
+            .skip => {},
+        }
+        return true;
+    }
+};
+
+test "OpenAI stream skips plain-text heartbeat frames after visible deltas" {
+    const Ignore = struct {
+        fn onChunk(_: *anyopaque, _: root.StreamChunk) void {}
+    };
+    var marker: u8 = 0;
+    var stream = OpenAiStream{ .allocator = std.testing.allocator, .callback = Ignore.onChunk, .ctx = &marker };
+    defer stream.deinit();
+    try std.testing.expect(try OpenAiStream.onLine(&stream, "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}"));
+    try std.testing.expect(try OpenAiStream.onLine(&stream, "data: heartbeat"));
+    try std.testing.expect(try OpenAiStream.onLine(&stream, "data:heartbeat"));
+    try std.testing.expect(try OpenAiStream.onLine(&stream, "data: {\"choices\":[{\"delta\":{\"content\":\" second\"}}]}"));
+    try std.testing.expect(!(try OpenAiStream.onLine(&stream, "data: [DONE]")));
+    try std.testing.expect(stream.metadata_error == null);
+    try std.testing.expectEqualStrings("first second", stream.accumulated.items);
+}
+
+test "OpenAI stream rejects malformed JSON between tool argument fragments" {
+    const Ignore = struct {
+        fn onChunk(_: *anyopaque, _: root.StreamChunk) void {}
+    };
+    var marker: u8 = 0;
+    var stream = OpenAiStream{ .allocator = std.testing.allocator, .callback = Ignore.onChunk, .ctx = &marker };
+    defer stream.deinit();
+    try std.testing.expect(try OpenAiStream.onLine(&stream, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"memory_store\",\"arguments\":\"{\\\"content\\\":\\\"first\"}}]}}]}"));
+    try std.testing.expect(try OpenAiStream.onLine(&stream, "data: {not-json}"));
+    try std.testing.expect(stream.metadata_error.? == error.InvalidSseJson);
+}
+
+/// Stream a provider reply through in-process libcurl and parse each frame once.
 pub fn curlStream(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -369,288 +440,36 @@ pub fn curlStream(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
-    // Check verbose mode once at function start
-    const log_enabled = verbose.isVerbose();
-    const debug_log = std.log.scoped(.sse);
-
-    // Build argv on stack (max 40 args)
-    var argv_buf: [40][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "--no-buffer";
-    argc += 1;
-    argv_buf[argc] = curlFailFastArg(allocator);
-    argc += 1;
-
-    var timeout_buf: [32]u8 = undefined;
-    if (timeout_secs > 0) {
-        const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch unreachable;
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = timeout_str;
-        argc += 1;
-    }
-
-    // Kill the curl process if transfer rate drops below 1 byte/second for 60 seconds.
-    // This catches providers that open the SSE connection but stall mid-stream without
-    // hitting the --max-time wall (e.g. glm-5 on infini-ai hanging on large contexts).
-    appendCurlStallDetectionArgs(argv_buf[0..], &argc);
-
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-
-    // Add proxy from environment if set
-    const proxy = http_util.getProxyFromEnv(allocator) catch null;
-    defer if (proxy) |p| allocator.free(p);
-
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
-
-    const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
-    defer if (resolve_entry) |entry| allocator.free(entry);
-    http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
-
-    var header_buf: [16][]const u8 = undefined;
-    var header_count: usize = 0;
-    header_buf[header_count] = "Content-Type: application/json";
-    header_count += 1;
+    var headers: [16][]const u8 = undefined;
+    var count: usize = 0;
     if (auth_header) |auth| {
-        if (header_count >= header_buf.len) return error.TooManyHeaders;
-        header_buf[header_count] = auth;
-        header_count += 1;
+        if (count >= headers.len) return error.TooManyHeaders;
+        headers[count] = auth;
+        count += 1;
+    }
+    for (extra_headers) |header| {
+        if (count >= headers.len) return error.TooManyHeaders;
+        headers[count] = header;
+        count += 1;
     }
 
-    for (extra_headers) |hdr| {
-        if (header_count >= header_buf.len) return error.TooManyHeaders;
-        header_buf[header_count] = hdr;
-        header_count += 1;
+    var stream = OpenAiStream{ .allocator = allocator, .callback = callback, .ctx = ctx };
+    defer stream.deinit();
+    const transfer = try native_sse.postJson(allocator, url, body, headers[0..count], timeout_secs, &stream, OpenAiStream.onLine);
+    if (stream.metadata_error) |err| return err;
+    if (transfer.status < 200 or transfer.status >= 300) return error.ServerError;
+    if (!transfer.ok) {
+        if (!root.shouldRecoverPartialStream(stream.accumulated.items.len, stream.saw_done)) return error.CurlFailed;
+        try closeReasoningBlock(allocator, &stream.accumulated, &stream.in_reasoning, callback, ctx);
+        callback(ctx, root.StreamChunk.finalChunk());
+        return finalizeStreamResultWithTools(allocator, &stream.accumulated, stream.usage, &stream.tools, false);
     }
-
-    var prepared_headers = try http_util.prepareCurlHeaderArg(allocator, header_buf[0..header_count]);
-    defer prepared_headers.deinit(allocator);
-    if (prepared_headers.arg) |headers_arg| {
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = headers_arg;
-        argc += 1;
-    }
-
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = "@-";
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    if (log_enabled) {
-        debug_log.info("curl argc={d}, body_len={d}, header_file={}", .{ argc, body.len, prepared_headers.uses_temp_file });
-    }
-
-    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    if (log_enabled) {
-        debug_log.info("spawning curl process...", .{});
-    }
-    try child.spawn();
-    if (log_enabled) {
-        const pid: i64 = if (@import("builtin").os.tag == .windows) @intCast(@intFromPtr(child.id)) else child.id;
-        debug_log.info("curl process spawned, pid={d}", .{pid});
-    }
-
-    if (child.stdin) |stdin_file| {
-        stdin_file.writeAll(body) catch {
-            stdin_file.close();
-            child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return error.CurlWriteError;
-        };
-        stdin_file.close();
-        child.stdin = null;
-    } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return error.CurlWriteError;
-    }
-
-    // Read stdout line by line, parse SSE events
-    var accumulated: std.ArrayListUnmanaged(u8) = .empty;
-    defer accumulated.deinit(allocator);
-
-    var line_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer line_buf.deinit(allocator);
-
-    const stdout_file = child.stdout.?;
-    var read_buf: [4096]u8 = undefined;
-    var saw_done = false;
-    var total_stdout: usize = 0;
-    var stream_usage: ?root.TokenUsage = null;
-    var in_reasoning = false;
-
-    outer: while (true) {
-        const n = stdout_file.read(&read_buf) catch |err| {
-            if (log_enabled) {
-                debug_log.info("stdout read error: {}", .{err});
-            }
-            break;
-        };
-        if (n == 0) {
-            if (log_enabled) {
-                debug_log.info("stdout read returned 0 bytes (EOF)", .{});
-            }
-            break;
-        }
-        total_stdout += n;
-
-        if (log_enabled) {
-            debug_log.info("stdout read {d} bytes", .{n});
-        }
-
-        // Check if this is JSON (starts with '{')
-        if (total_stdout == n and read_buf[0] == '{') {
-            if (log_enabled) {
-                debug_log.info("Detected JSON response, not SSE", .{});
-            }
-            // This is a JSON error, not SSE
-            const json_response = try allocator.dupe(u8, read_buf[0..n]);
-            defer allocator.free(json_response);
-
-            // Try to classify the error
-            const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch null;
-            if (parsed) |p| {
-                defer p.deinit();
-                if (p.value == .object) {
-                    if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
-                        const mapped_err = error_classify.kindToError(kind);
-                        recordStreamApiErrorDetail(allocator, p.value.object, mapped_err);
-                        _ = child.wait() catch {};
-                        return mapped_err;
-                    }
-                }
-            }
-
-            // Return a meaningful error
-            recordStreamApiErrorBody(allocator, json_response);
-            _ = child.wait() catch {};
-            debug_log.err("Server returned JSON error payload: len={d}", .{json_response.len});
-            return error.ServerError;
-        }
-
-        for (read_buf[0..n]) |byte| {
-            if (byte == '\n') {
-                if (log_enabled) {
-                    debug_log.info("parsing SSE line: len={d}", .{line_buf.items.len});
-                }
-                const result = parseSseLine(allocator, line_buf.items) catch {
-                    line_buf.clearRetainingCapacity();
-                    continue;
-                };
-                line_buf.clearRetainingCapacity();
-                switch (result) {
-                    .delta => |content| {
-                        defer content.deinit(allocator);
-                        try appendDeltaContent(allocator, &accumulated, &in_reasoning, callback, ctx, content);
-                    },
-                    .usage => |u| stream_usage = u,
-                    .done => {
-                        if (log_enabled) {
-                            debug_log.info("SSE stream done", .{});
-                        }
-                        saw_done = true;
-                        break :outer;
-                    },
-                    .skip => {},
-                }
-            } else {
-                try line_buf.append(allocator, byte);
-            }
-        }
-    }
-
-    if (log_enabled) {
-        debug_log.info("stdout stream ended, saw_done={}, accumulated_len={d}, total_stdout={d}", .{ saw_done, accumulated.items.len, total_stdout });
-    }
-
-    // Parse a trailing line when the stream ends without a final '\n'.
-    if (!saw_done and line_buf.items.len > 0) {
-        const trailing = parseSseLine(allocator, line_buf.items) catch null;
-        line_buf.clearRetainingCapacity();
-        if (trailing) |result| {
-            switch (result) {
-                .delta => |content| {
-                    defer content.deinit(allocator);
-                    try appendDeltaContent(allocator, &accumulated, &in_reasoning, callback, ctx, content);
-                },
-                .usage => |u| stream_usage = u,
-                .done => {},
-                .skip => {},
-            }
-        }
-    }
-
-    // Drain remaining stdout to prevent deadlock on wait()
-    while (true) {
-        const n = stdout_file.read(&read_buf) catch break;
-        if (n == 0) break;
-        if (log_enabled) {
-            debug_log.info("drained {d} more stdout bytes", .{n});
-        }
-    }
-
-    if (log_enabled) {
-        debug_log.info("waiting for curl process to exit...", .{});
-    }
-    const term = child.wait() catch |err| {
-        log.err("curlStream child.wait failed: {}", .{err});
-        if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
-            log.warn("curlStream proceeding despite wait failure after partial stream output", .{});
-            try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
-            callback(ctx, root.StreamChunk.finalChunk());
-            return finalizeStreamResult(allocator, accumulated.items, stream_usage);
-        }
-        return error.CurlWaitError;
-    };
-    if (log_enabled) {
-        debug_log.info("curl process terminated: {}", .{term});
-    }
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
-                log.warn("curlStream exit code {d} after partial stream output; returning accumulated output", .{code});
-                try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
-                callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, stream_usage);
-            }
-            return error.CurlFailed;
-        },
-        else => {
-            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
-                log.warn("curlStream abnormal termination after partial stream output; returning accumulated output", .{});
-                try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
-                callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, stream_usage);
-            }
-            return error.CurlFailed;
-        },
-    }
-
-    // Signal stream completion only after curl exits successfully.
-    try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
+    try validateToolFinish(&stream.tools);
+    const complete = stream.saw_done or stream.tools.finish_reason != .unknown;
+    try closeReasoningBlock(allocator, &stream.accumulated, &stream.in_reasoning, callback, ctx);
+    const result = try finalizeStreamResultWithTools(allocator, &stream.accumulated, stream.usage, &stream.tools, complete);
     callback(ctx, root.StreamChunk.finalChunk());
-    return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+    return result;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -757,10 +576,52 @@ pub fn extractAnthropicUsage(json_str: []const u8) !?u32 {
     return @intCast(output_tokens.integer);
 }
 
-/// Run curl in SSE streaming mode for Anthropic and parse output line by line.
-///
-/// Similar to `curlStream()` but uses stateful Anthropic SSE parsing.
-/// `headers` is a slice of pre-formatted header strings (e.g. "x-api-key: sk-...").
+const AnthropicStream = struct {
+    allocator: std.mem.Allocator,
+    callback: root.StreamCallback,
+    ctx: *anyopaque,
+    accumulated: std.ArrayListUnmanaged(u8) = .empty,
+    current_event: []const u8 = "",
+    usage: root.TokenUsage = .{},
+    first_line: bool = true,
+    saw_done: bool = false,
+
+    fn deinit(self: *AnthropicStream) void {
+        self.accumulated.deinit(self.allocator);
+        if (self.current_event.len > 0) self.allocator.free(@constCast(self.current_event));
+    }
+
+    fn onLine(context: *anyopaque, line: []const u8) anyerror!bool {
+        const self: *AnthropicStream = @ptrCast(@alignCast(context));
+        if (self.first_line) if (initialJsonError(self.allocator, line)) |err| return err;
+        self.first_line = false;
+        const result = parseAnthropicSseLine(self.allocator, line, self.current_event) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return true;
+        };
+        switch (result) {
+            .event => |event| {
+                const next = try self.allocator.dupe(u8, event);
+                if (self.current_event.len > 0) self.allocator.free(@constCast(self.current_event));
+                self.current_event = next;
+            },
+            .delta => |delta| {
+                defer self.allocator.free(delta);
+                try appendStreamOutput(self.allocator, &self.accumulated, delta);
+                self.callback(self.ctx, root.StreamChunk.textDelta(delta));
+            },
+            .usage => |tokens| self.usage.completion_tokens = tokens,
+            .done => {
+                self.saw_done = true;
+                return false;
+            },
+            .skip => {},
+        }
+        return true;
+    }
+};
+
+/// Stream an Anthropic reply through in-process libcurl.
 pub fn curlStreamAnthropic(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -769,210 +630,14 @@ pub fn curlStreamAnthropic(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
-    // Build argv on stack (max 40 args)
-    var argv_buf: [40][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "--no-buffer";
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-
-    // Add proxy from environment if set
-    const proxy = http_util.getProxyFromEnv(allocator) catch null;
-    defer if (proxy) |p| allocator.free(p);
-
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
-
-    const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
-    defer if (resolve_entry) |entry| allocator.free(entry);
-    http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
-
-    var header_buf: [16][]const u8 = undefined;
-    var header_count: usize = 0;
-    header_buf[header_count] = "Content-Type: application/json";
-    header_count += 1;
-    for (headers) |hdr| {
-        if (header_count >= header_buf.len) return error.TooManyHeaders;
-        header_buf[header_count] = hdr;
-        header_count += 1;
-    }
-
-    var prepared_headers = try http_util.prepareCurlHeaderArg(allocator, header_buf[0..header_count]);
-    defer prepared_headers.deinit(allocator);
-    if (prepared_headers.arg) |headers_arg| {
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = headers_arg;
-        argc += 1;
-    }
-
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = "@-";
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
-
-    if (child.stdin) |stdin_file| {
-        stdin_file.writeAll(body) catch {
-            stdin_file.close();
-            child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return error.CurlWriteError;
-        };
-        stdin_file.close();
-        child.stdin = null;
-    } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return error.CurlWriteError;
-    }
-
-    // Read stdout line by line, parse Anthropic SSE events
-    var accumulated: std.ArrayListUnmanaged(u8) = .empty;
-    defer accumulated.deinit(allocator);
-
-    var line_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer line_buf.deinit(allocator);
-
-    var current_event: []const u8 = "";
-    var anthropic_usage: root.TokenUsage = .{};
-    var saw_done = false;
-
-    const file = child.stdout.?;
-    var read_buf: [4096]u8 = undefined;
-    var total_stdout: usize = 0;
-
-    outer: while (true) {
-        const n = file.read(&read_buf) catch break;
-        if (n == 0) break;
-        total_stdout += n;
-
-        // A body that opens with '{' is a JSON error payload, not an SSE
-        // stream. Without this branch every line parses as `.skip`, the loop
-        // drains, and the non-zero exit falls through to `CurlFailed` — which
-        // reads as a transport fault and names neither the model nor the
-        // status. Anthropic answers a model that does not exist with
-        // {"type":"error","error":{"type":"not_found_error","message":...}},
-        // so classify it the way the OpenAI-compatible stream does and keep
-        // the words.
-        if (total_stdout == n and read_buf[0] == '{') {
-            // No dupe: `read_buf` is this frame's own stack buffer and nothing
-            // reads it again before the returns below, so the slice outlives
-            // every use here. Copying it would add an allocation whose failure
-            // path leaks `current_event` and skips the reap.
-            const json_response = read_buf[0..n];
-            if (current_event.len > 0) allocator.free(@constCast(current_event));
-
-            const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch null;
-            if (parsed) |p| {
-                defer p.deinit();
-                if (p.value == .object) {
-                    if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
-                        const mapped_err = error_classify.kindToError(kind);
-                        recordStreamApiErrorDetail(allocator, p.value.object, mapped_err);
-                        _ = child.wait() catch {};
-                        return mapped_err;
-                    }
-                }
-            }
-
-            recordStreamApiErrorBody(allocator, json_response);
-            _ = child.wait() catch {};
-            return error.ServerError;
-        }
-
-        for (read_buf[0..n]) |byte| {
-            if (byte == '\n') {
-                const result = parseAnthropicSseLine(allocator, line_buf.items, current_event) catch {
-                    line_buf.clearRetainingCapacity();
-                    continue;
-                };
-                switch (result) {
-                    .event => |ev| {
-                        // Dupe event name — it points into line_buf which we're about to clear
-                        if (current_event.len > 0) allocator.free(@constCast(current_event));
-                        current_event = allocator.dupe(u8, ev) catch "";
-                    },
-                    .delta => |text| {
-                        defer allocator.free(text);
-                        try accumulated.appendSlice(allocator, text);
-                        callback(ctx, root.StreamChunk.textDelta(text));
-                    },
-                    .usage => |tokens| anthropic_usage.completion_tokens = tokens,
-                    .done => {
-                        saw_done = true;
-                        line_buf.clearRetainingCapacity();
-                        break :outer;
-                    },
-                    .skip => {},
-                }
-                line_buf.clearRetainingCapacity();
-            } else {
-                try line_buf.append(allocator, byte);
-            }
-        }
-    }
-
-    // Free owned event string
-    if (current_event.len > 0) allocator.free(@constCast(current_event));
-
-    // Drain remaining stdout to prevent deadlock on wait()
-    while (true) {
-        const n = file.read(&read_buf) catch break;
-        if (n == 0) break;
-    }
-
-    const term = child.wait() catch |err| {
-        log.err("curlStreamAnthropic child.wait failed: {}", .{err});
-        if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
-            log.warn("curlStreamAnthropic proceeding despite wait failure after partial stream output", .{});
-            callback(ctx, root.StreamChunk.finalChunk());
-            return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
-        }
-        return error.CurlWaitError;
-    };
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
-                log.warn("curlStreamAnthropic exit code {d} after partial stream output; returning accumulated output", .{code});
-                callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
-            }
-            return error.CurlFailed;
-        },
-        else => {
-            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
-                log.warn("curlStreamAnthropic abnormal termination after partial stream output; returning accumulated output", .{});
-                callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
-            }
-            return error.CurlFailed;
-        },
-    }
-
+    var stream = AnthropicStream{ .allocator = allocator, .callback = callback, .ctx = ctx };
+    defer stream.deinit();
+    const transfer = try native_sse.postJson(allocator, url, body, headers, 0, &stream, AnthropicStream.onLine);
+    if (transfer.status < 200 or transfer.status >= 300) return error.ServerError;
+    if (!transfer.ok and !root.shouldRecoverPartialStream(stream.accumulated.items.len, stream.saw_done))
+        return error.CurlFailed;
     callback(ctx, root.StreamChunk.finalChunk());
-    return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+    return finalizeStreamResult(allocator, &stream.accumulated, stream.usage);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1003,18 +668,41 @@ test "parseSseLine valid delta without optional space" {
     }
 }
 
-test "appendCurlStallDetectionArgs appends curl speed flags in order" {
-    // Regression: stalled SSE streams must trip curl's speed-limit instead of
-    // hanging until --max-time expires with an idle-but-open connection.
-    var argv_buf: [8][]const u8 = undefined;
-    var argc: usize = 0;
-    appendCurlStallDetectionArgs(argv_buf[0..], &argc);
+test "one decoded frame supplies text and tool metadata" {
+    const allocator = std.testing.allocator;
+    var collector = stream_tools.Collector{};
+    defer collector.deinit(allocator);
+    const line = "data: {\"choices\":[{\"delta\":{\"content\":\"working\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"probe\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}";
+    const result = try parseSseLineWithTools(allocator, line, &collector);
+    switch (result) {
+        .delta => |content| {
+            defer content.deinit(allocator);
+            try std.testing.expectEqualStrings("working", content.text);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const calls = try collector.take(allocator);
+    defer {
+        for (calls) |call| {
+            allocator.free(call.id);
+            allocator.free(call.name);
+            allocator.free(call.arguments);
+        }
+        allocator.free(calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("probe", calls[0].name);
+    try std.testing.expectEqual(root.StreamFinishReason.tool_calls, collector.finish_reason);
+}
 
-    try std.testing.expectEqual(@as(usize, 4), argc);
-    try std.testing.expectEqualStrings("--speed-limit", argv_buf[0]);
-    try std.testing.expectEqualStrings("1", argv_buf[1]);
-    try std.testing.expectEqualStrings("--speed-time", argv_buf[2]);
-    try std.testing.expectEqualStrings("60", argv_buf[3]);
+test "tool fragments require a tool_calls finish reason" {
+    var collector = stream_tools.Collector{};
+    defer collector.deinit(std.testing.allocator);
+    try collector.feedLine(std.testing.allocator, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"probe\",\"arguments\":\"{}\"}}]}}]}");
+    try collector.feedLine(std.testing.allocator, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}");
+    try std.testing.expectError(error.IncompleteStreamToolCall, validateToolFinish(&collector));
+    collector.finish_reason = .tool_calls;
+    try validateToolFinish(&collector);
 }
 
 test "parseSseLine DONE sentinel" {
@@ -1025,19 +713,6 @@ test "parseSseLine DONE sentinel" {
 test "parseSseLine DONE sentinel without optional space" {
     const result = try parseSseLine(std.testing.allocator, "data:[DONE]");
     try std.testing.expect(result == .done);
-}
-
-test "curlVersionSupportsFailWithBody rejects curl older than 7.76.0" {
-    try std.testing.expect(!curlVersionSupportsFailWithBody("curl 7.68.0 (x86_64-pc-linux-gnu) libcurl/7.68.0"));
-}
-
-test "curlVersionSupportsFailWithBody accepts curl 7.76.0 and newer" {
-    try std.testing.expect(curlVersionSupportsFailWithBody("curl 7.76.0 (x86_64-pc-linux-gnu) libcurl/7.76.0"));
-    try std.testing.expect(curlVersionSupportsFailWithBody("curl 8.17.0 (x86_64-alpine-linux-musl) libcurl/8.17.0"));
-}
-
-test "curlVersionSupportsFailWithBody tolerates suffixes in version token" {
-    try std.testing.expect(curlVersionSupportsFailWithBody("curl 8.17.0-DEV (x86_64) libcurl/8.17.0"));
 }
 
 test "parseSseLine empty line" {
@@ -1130,6 +805,7 @@ test "appendDeltaContent closes reasoning before final" {
     const Collector = struct {
         buf: std.ArrayListUnmanaged(u8) = .empty,
         saw_final: bool = false,
+        saw_reasoning: bool = false,
 
         fn callback(ctx: *anyopaque, chunk: root.StreamChunk) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -1137,6 +813,7 @@ test "appendDeltaContent closes reasoning before final" {
                 self.saw_final = true;
                 return;
             }
+            if (chunk.kind == .reasoning) self.saw_reasoning = true;
             self.buf.appendSlice(std.testing.allocator, chunk.delta) catch unreachable;
         }
     };
@@ -1156,6 +833,7 @@ test "appendDeltaContent closes reasoning before final" {
     Collector.callback(@ptrCast(&collector), root.StreamChunk.finalChunk());
 
     try std.testing.expect(collector.saw_final);
+    try std.testing.expect(collector.saw_reasoning);
     try std.testing.expect(!in_reasoning);
     try std.testing.expectEqualStrings("<think>private</think>", accumulated.items);
     try std.testing.expectEqualStrings("<think>private</think>", collector.buf.items);
@@ -1273,9 +951,12 @@ test "extractStreamUsage returns null for invalid JSON" {
 }
 
 test "finalizeStreamResult separates think blocks into reasoning content" {
+    var accumulated: std.ArrayListUnmanaged(u8) = .empty;
+    defer accumulated.deinit(std.testing.allocator);
+    try accumulated.appendSlice(std.testing.allocator, "<think>private trace</think>Visible answer");
     const result = try finalizeStreamResult(
         std.testing.allocator,
-        "<think>private trace</think>Visible answer",
+        &accumulated,
         .{ .completion_tokens = 4, .total_tokens = 4 },
     );
     defer {
@@ -1285,6 +966,16 @@ test "finalizeStreamResult separates think blocks into reasoning content" {
 
     try std.testing.expectEqualStrings("Visible answer", result.content.?);
     try std.testing.expectEqualStrings("private trace", result.reasoning_content.?);
+}
+
+test "finalizeStreamResult transfers plain output ownership" {
+    var accumulated: std.ArrayListUnmanaged(u8) = .empty;
+    defer accumulated.deinit(std.testing.allocator);
+    try accumulated.appendSlice(std.testing.allocator, "visible answer");
+    const result = try finalizeStreamResult(std.testing.allocator, &accumulated, null);
+    defer std.testing.allocator.free(result.content.?);
+    try std.testing.expectEqualStrings("visible answer", result.content.?);
+    try std.testing.expectEqual(@as(usize, 0), accumulated.items.len);
 }
 
 test "parseSseLine extracts usage from final chunk" {
@@ -1434,4 +1125,341 @@ test "an Anthropic streamed overload payload maps to the rate-limit bucket" {
     const detail = (try root.snapshotLastApiErrorDetail(allocator)).?;
     defer allocator.free(detail);
     try std.testing.expect(std.mem.indexOf(u8, detail, "429") != null);
+}
+
+const LOCAL_STREAM_CALLS = 100;
+const LOCAL_STREAM_WORKERS = 10;
+const LOCAL_STREAM_RESPONSE_BODY = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+const LOCAL_STREAM_RESPONSE = std.fmt.comptimePrint(
+    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+    .{ LOCAL_STREAM_RESPONSE_BODY.len, LOCAL_STREAM_RESPONSE_BODY },
+);
+
+fn readLocalStreamRequest(stream: std_compat.net.Stream) !void {
+    var request: [2048]u8 = undefined;
+    var used: usize = 0;
+    while (used < request.len) {
+        const n = try stream.read(request[used..]);
+        if (n == 0) return error.TestUnexpectedResult;
+        used += n;
+        const end = std.mem.indexOf(u8, request[0..used], "\r\n\r\n") orelse continue;
+        if (used >= end + 6) return; // Header terminator plus the two-byte body.
+    }
+    return error.TestUnexpectedResult;
+}
+
+const LocalStreamServer = struct {
+    server: *std_compat.net.Server,
+    response: []const u8 = LOCAL_STREAM_RESPONSE,
+    response_delay_ns: u64 = 0,
+    stop: std.atomic.Value(bool) = .init(false),
+    accepted: std.atomic.Value(usize) = .init(0),
+    active: std.atomic.Value(usize) = .init(0),
+    peak: std.atomic.Value(usize) = .init(0),
+
+    fn stopAndJoin(self: *LocalStreamServer, thread: *std.Thread) void {
+        self.stop.store(true, .release);
+        self.unblock();
+        thread.join();
+    }
+
+    fn stopAndJoinMany(self: *LocalStreamServer, threads: []std.Thread) void {
+        self.stop.store(true, .release);
+        for (threads) |_| self.unblock();
+        for (threads) |*thread| thread.join();
+    }
+
+    fn unblock(self: *LocalStreamServer) void {
+        const conn = std_compat.net.tcpConnectToAddress(self.server.listen_address) catch null;
+        if (conn) |stream| stream.close();
+    }
+
+    fn run(self: *LocalStreamServer) void {
+        while (true) {
+            var conn = self.server.accept() catch return;
+            defer conn.stream.close();
+            if (self.stop.load(.acquire)) return;
+            _ = self.accepted.fetchAdd(1, .monotonic);
+            const concurrent = self.active.fetchAdd(1, .monotonic) + 1;
+            defer _ = self.active.fetchSub(1, .monotonic);
+            _ = self.peak.fetchMax(concurrent, .monotonic);
+            readLocalStreamRequest(conn.stream) catch return;
+            if (self.response_delay_ns > 0) std_compat.thread.sleep(self.response_delay_ns);
+            conn.stream.writeAll(self.response) catch return;
+        }
+    }
+};
+
+const LocalStreamSample = struct {
+    first_ms: u64 = 0,
+    final_ms: u64 = 0,
+    success: bool = false,
+};
+
+const LocalStreamCallback = struct {
+    first: i96 = 0,
+    final_calls: usize = 0,
+
+    fn onChunk(ptr: *anyopaque, chunk: root.StreamChunk) void {
+        const self: *LocalStreamCallback = @ptrCast(@alignCast(ptr));
+        if (chunk.is_final) {
+            self.final_calls += 1;
+        } else if (chunk.delta.len > 0 and self.first == 0) {
+            self.first = std.Io.Clock.awake.now(std_compat.io()).nanoseconds;
+        }
+    }
+};
+
+const LocalStreamWorker = struct {
+    url: []const u8,
+    samples: []LocalStreamSample,
+
+    fn run(self: *LocalStreamWorker) void {
+        for (self.samples) |*sample| {
+            const started = std.Io.Clock.awake.now(std_compat.io()).nanoseconds;
+            var callback = LocalStreamCallback{};
+            const result = curlStream(std.heap.page_allocator, self.url, "{}", null, &.{}, 5, LocalStreamCallback.onChunk, &callback) catch continue;
+            defer {
+                if (result.content) |content| std.heap.page_allocator.free(content);
+                if (result.reasoning_content) |reasoning| std.heap.page_allocator.free(reasoning);
+            }
+            const finished = std.Io.Clock.awake.now(std_compat.io()).nanoseconds;
+            sample.success = callback.first != 0 and callback.final_calls == 1 and
+                result.content != null and std.mem.eql(u8, result.content.?, "ok");
+            if (sample.success) {
+                sample.first_ms = @intCast(@divTrunc(callback.first - started, std.time.ns_per_ms));
+                sample.final_ms = @intCast(@divTrunc(finished - started, std.time.ns_per_ms));
+            }
+        }
+    }
+};
+
+test "100 local SSE calls return complete replies with ten concurrent workers" {
+    if (!@import("build_options").stream_transport_tests) return error.SkipZigTest;
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    var serving = LocalStreamServer{ .server = &server, .response_delay_ns = 10 * std.time.ns_per_ms };
+    var server_threads: [LOCAL_STREAM_WORKERS]std.Thread = undefined;
+    for (&server_threads) |*thread| thread.* = try std.Thread.spawn(.{}, LocalStreamServer.run, .{&serving});
+    var server_joined = false;
+    defer if (!server_joined) serving.stopAndJoinMany(&server_threads);
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/stream", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+    var samples = [_]LocalStreamSample{.{}} ** LOCAL_STREAM_CALLS;
+    var workers: [LOCAL_STREAM_WORKERS]LocalStreamWorker = undefined;
+    var threads: [LOCAL_STREAM_WORKERS]std.Thread = undefined;
+    const concurrent_started = std.Io.Clock.awake.now(std_compat.io()).nanoseconds;
+    for (&workers, 0..) |*worker, i| {
+        const begin = i * (LOCAL_STREAM_CALLS / LOCAL_STREAM_WORKERS);
+        worker.* = .{ .url = url, .samples = samples[begin .. begin + LOCAL_STREAM_CALLS / LOCAL_STREAM_WORKERS] };
+        threads[i] = try std.Thread.spawn(.{}, LocalStreamWorker.run, .{worker});
+    }
+    for (&threads) |*thread| thread.join();
+    const concurrent_ms: u64 = @intCast(@divTrunc(std.Io.Clock.awake.now(std_compat.io()).nanoseconds - concurrent_started, std.time.ns_per_ms));
+
+    var serial_samples = [_]LocalStreamSample{.{}} ** LOCAL_STREAM_CALLS;
+    var serial_worker = LocalStreamWorker{ .url = url, .samples = &serial_samples };
+    const serial_started = std.Io.Clock.awake.now(std_compat.io()).nanoseconds;
+    serial_worker.run();
+    const serial_ms: u64 = @intCast(@divTrunc(std.Io.Clock.awake.now(std_compat.io()).nanoseconds - serial_started, std.time.ns_per_ms));
+    serving.stopAndJoinMany(&server_threads);
+    server_joined = true;
+
+    var first: [LOCAL_STREAM_CALLS]u64 = undefined;
+    var final: [LOCAL_STREAM_CALLS]u64 = undefined;
+    for (samples, 0..) |sample, i| {
+        try std.testing.expect(sample.success);
+        first[i] = sample.first_ms;
+        final[i] = sample.final_ms;
+    }
+    for (serial_samples) |sample| try std.testing.expect(sample.success);
+    try std.testing.expectEqual(@as(usize, 2 * LOCAL_STREAM_CALLS), serving.accepted.load(.acquire));
+    try std.testing.expect(serving.peak.load(.acquire) >= 2);
+    std.mem.sortUnstable(u64, &first, {}, std.sort.asc(u64));
+    std.mem.sortUnstable(u64, &final, {}, std.sort.asc(u64));
+    std.debug.print("local SSE 100/100: concurrent={d}ms serial={d}ms; first p50={d}ms p95={d}ms p99={d}ms; final p50={d}ms p95={d}ms p99={d}ms\n", .{
+        concurrent_ms, serial_ms, first[49], first[94], first[98], final[49], final[94], final[98],
+    });
+}
+
+test "local libcurl stream assembles fragmented tool calls" {
+    if (!@import("build_options").stream_transport_tests) return error.SkipZigTest;
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const body =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_\",\"type\":\"function\",\"function\":{\"name\":\"memory_\",\"arguments\":\"{\\\"key\\\":\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"1\",\"function\":{\"name\":\"store\",\"arguments\":\"\\\"lantern\\\"}\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n" ++
+        "data: [DONE]\n";
+    const response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n" ++ body;
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    var serving = LocalStreamServer{ .server = &server, .response = response };
+    var thread = try std.Thread.spawn(.{}, LocalStreamServer.run, .{&serving});
+    var joined = false;
+    defer if (!joined) serving.stopAndJoin(&thread);
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/stream", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+    var callback = LocalStreamCallback{};
+    const result = try curlStream(allocator, url, "{}", null, &.{}, 4, LocalStreamCallback.onChunk, &callback);
+    defer {
+        if (result.content) |content| allocator.free(content);
+        if (result.reasoning_content) |reasoning| allocator.free(reasoning);
+        for (result.tool_calls) |call| {
+            allocator.free(call.id);
+            allocator.free(call.name);
+            allocator.free(call.arguments);
+        }
+        allocator.free(result.tool_calls);
+    }
+    serving.stopAndJoin(&thread);
+    joined = true;
+    try std.testing.expectEqual(@as(usize, 1), callback.final_calls);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("memory_store", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"key\":\"lantern\"}", result.tool_calls[0].arguments);
+}
+
+test "local HTTP errors and redirects cannot become successful partial replies" {
+    if (!@import("build_options").stream_transport_tests) return error.SkipZigTest;
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const partial = "data: {\"choices\":[{\"delta\":{\"content\":\"misleading\"}}]}\n";
+    const responses = [_][]const u8{
+        "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/event-stream\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n" ++ partial,
+        "HTTP/1.1 302 Found\r\nLocation: https://example.com/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    };
+    for (responses) |response| {
+        const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+        var server = try addr.listen(.{});
+        defer server.deinit();
+        var serving = LocalStreamServer{ .server = &server, .response = response };
+        var thread = try std.Thread.spawn(.{}, LocalStreamServer.run, .{&serving});
+        defer serving.stopAndJoin(&thread);
+        const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/stream", .{server.listen_address.in.getPort()});
+        defer std.testing.allocator.free(url);
+        var callback = LocalStreamCallback{};
+        try std.testing.expectError(error.ServerError, curlStream(
+            std.testing.allocator,
+            url,
+            "{}",
+            null,
+            &.{},
+            4,
+            LocalStreamCallback.onChunk,
+            &callback,
+        ));
+        try std.testing.expectEqual(@as(usize, 0), callback.final_calls);
+    }
+}
+
+const HeldOpenStreamServer = struct {
+    server: *std_compat.net.Server,
+    caller_returned: *std.atomic.Value(bool),
+    sent: ?*std.atomic.Value(bool) = null,
+    saw_caller_return: bool = false,
+
+    fn run(self: *HeldOpenStreamServer) void {
+        var conn = self.server.accept() catch return;
+        defer conn.stream.close();
+        readLocalStreamRequest(conn.stream) catch return;
+        const response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n" ++ LOCAL_STREAM_RESPONSE_BODY;
+        conn.stream.writeAll(response) catch return;
+        if (self.sent) |sent| sent.store(true, .release);
+        for (0..200) |_| {
+            if (self.caller_returned.load(.acquire)) {
+                self.saw_caller_return = true;
+                return;
+            }
+            std_compat.thread.sleep(10 * std.time.ns_per_ms);
+        }
+    }
+};
+
+test "terminal SSE event completes before a provider closes its socket" {
+    if (!@import("build_options").stream_transport_tests) return error.SkipZigTest;
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    var returned = std.atomic.Value(bool).init(false);
+    var held_open = HeldOpenStreamServer{ .server = &server, .caller_returned = &returned };
+    var thread = try std.Thread.spawn(.{}, HeldOpenStreamServer.run, .{&held_open});
+    var joined = false;
+    defer if (!joined) thread.join();
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/stream", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+    var callback = LocalStreamCallback{};
+    const result = try curlStream(allocator, url, "{}", null, &.{}, 4, LocalStreamCallback.onChunk, &callback);
+    defer if (result.content) |content| allocator.free(content);
+    returned.store(true, .release);
+    thread.join();
+    joined = true;
+    try std.testing.expect(held_open.saw_caller_return);
+    try std.testing.expectEqual(@as(usize, 1), callback.final_calls);
+    try std.testing.expectEqualStrings("ok", result.content.?);
+}
+
+test "idle native HTTP stream stops within one poll interval budget" {
+    if (!@import("build_options").stream_transport_tests) return error.SkipZigTest;
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const native_http = @import("../native_http.zig");
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    var release_server = std.atomic.Value(bool).init(false);
+    var sent = std.atomic.Value(bool).init(false);
+    var held_open = HeldOpenStreamServer{ .server = &server, .caller_returned = &release_server, .sent = &sent };
+    var server_thread = try std.Thread.spawn(.{}, HeldOpenStreamServer.run, .{&held_open});
+    defer {
+        release_server.store(true, .release);
+        server_thread.join();
+    }
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/stream", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+    var interrupted = std.atomic.Value(bool).init(false);
+    const CancelRequest = struct {
+        url: []const u8,
+        flag: *const std.atomic.Value(bool),
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var response = native_http.perform(std.heap.page_allocator, .{
+                .method = .post,
+                .url = self.url,
+                .body = "{}",
+                .timeout_secs = 4,
+                .interrupt_flag = self.flag,
+            }) catch |err| {
+                self.result = err;
+                return;
+            };
+            response.deinit(std.heap.page_allocator);
+        }
+    };
+    var request = CancelRequest{ .url = url, .flag = &interrupted };
+    var caller_thread = try std.Thread.spawn(.{}, CancelRequest.run, .{&request});
+    var caller_joined = false;
+    defer if (!caller_joined) {
+        interrupted.store(true, .release);
+        caller_thread.join();
+    };
+    for (0..100) |_| {
+        if (sent.load(.acquire)) break;
+        std_compat.thread.sleep(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(sent.load(.acquire));
+    const started = std.Io.Clock.awake.now(std_compat.io()).nanoseconds;
+    interrupted.store(true, .release);
+    caller_thread.join();
+    caller_joined = true;
+    const elapsed_ms = @divTrunc(std.Io.Clock.awake.now(std_compat.io()).nanoseconds - started, std.time.ns_per_ms);
+    try std.testing.expectEqual(error.CurlInterrupted, request.result.?);
+    try std.testing.expect(elapsed_ms < 500);
 }

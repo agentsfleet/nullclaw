@@ -510,10 +510,8 @@ pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []cons
     // Thread the SSRF-safe resolve pin (built above) through to the dial: the request
     // must reach the validated address, never one re-resolved at connect time — that
     // gap is a DNS-rebinding TOCTOU (the prior std.http call discarded the pin).
-    // curlPostWithProxyAndResolve pins a remote host with curl --resolve AND keeps
-    // Authorization/x-api-key off the child argv (headers go to a 0600 temp file, the
-    // body rides stdin); an explicit local host yields a null pin and falls back to
-    // std.http, which needs none.
+    // The native transport pins remote connections and keeps credentials in
+    // request headers, without placing them in subprocess arguments.
     var timeout_buf: [20]u8 = undefined;
     const max_time: ?[]const u8 = if (timeout_secs == 0)
         null
@@ -532,8 +530,7 @@ pub fn curlPostFormTimed(allocator: std.mem.Allocator, url: []const u8, body: []
     defer if (resolve_entry) |entry| allocator.free(entry);
     // Same DNS-rebinding TOCTOU fix as curlPostTimed: thread the resolve pin so the
     // form POST (OAuth token exchange) dials the validated address.
-    // curlPostFormWithProxyAndResolve pins a remote host via curl --resolve (body on
-    // stdin); a local host (null pin) uses the std.http fallback.
+    // The native transport uses the validated address for remote hosts.
     var timeout_buf: [20]u8 = undefined;
     const max_time: ?[]const u8 = if (timeout_secs == 0)
         null
