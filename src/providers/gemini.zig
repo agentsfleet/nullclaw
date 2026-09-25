@@ -8,6 +8,7 @@ const error_classify = @import("error_classify.zig");
 const config_types = @import("../config_types.zig");
 const http_util = @import("../http_util.zig");
 const sse = @import("sse.zig");
+const line_reader = @import("sse_line_reader.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
@@ -409,7 +410,7 @@ pub fn tryLoadGeminiCliToken(allocator: std.mem.Allocator) ?GeminiCliCredentials
 
 /// Authentication method for Gemini.
 pub const GeminiAuth = union(enum) {
-    /// Explicit API key from config: sent as `?key=` query parameter.
+    /// Explicit API key from config: sent in the protected `x-goog-api-key` header.
     explicit_key: []const u8,
     /// API key from `GEMINI_API_KEY` env var.
     env_gemini_key: []const u8,
@@ -435,6 +436,12 @@ pub const GeminiAuth = union(enum) {
             .env_oauth_token => |v| v,
             .oauth_token => |v| v,
         };
+    }
+
+    /// Caller must free the header after the request helper has prepared it.
+    pub fn header(self: GeminiAuth, allocator: std.mem.Allocator) ![]u8 {
+        if (self.isApiKey()) return std.fmt.allocPrint(allocator, "x-goog-api-key: {s}", .{self.credential()});
+        return std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{self.credential()});
     }
 
     pub fn source(self: GeminiAuth) []const u8 {
@@ -546,63 +553,23 @@ pub const GeminiProvider = struct {
     };
 
     /// Build the generateContent URL.
-    pub fn buildUrl(allocator: std.mem.Allocator, model: []const u8, auth: GeminiAuth) ![]const u8 {
+    pub fn buildUrl(allocator: std.mem.Allocator, model: []const u8) ![]const u8 {
         const model_name = if (std.mem.startsWith(u8, model, "models/"))
             model
         else
             try std.fmt.allocPrint(allocator, "models/{s}", .{model});
-
-        if (auth.isApiKey()) {
-            const url = try std.fmt.allocPrint(
-                allocator,
-                "{s}/{s}:generateContent?key={s}",
-                .{ BASE_URL, model_name, auth.credential() },
-            );
-            if (!std.mem.startsWith(u8, model, "models/")) {
-                allocator.free(@constCast(model_name));
-            }
-            return url;
-        } else {
-            const url = try std.fmt.allocPrint(
-                allocator,
-                "{s}/{s}:generateContent",
-                .{ BASE_URL, model_name },
-            );
-            if (!std.mem.startsWith(u8, model, "models/")) {
-                allocator.free(@constCast(model_name));
-            }
-            return url;
-        }
+        defer if (!std.mem.startsWith(u8, model, "models/")) allocator.free(@constCast(model_name));
+        return std.fmt.allocPrint(allocator, "{s}/{s}:generateContent", .{ BASE_URL, model_name });
     }
 
-    /// Build the streamGenerateContent URL for SSE streaming.
-    pub fn buildStreamUrl(allocator: std.mem.Allocator, model: []const u8, auth: GeminiAuth) ![]const u8 {
+    /// Build the streamGenerateContent URL for SSE streaming. Credentials stay in headers.
+    pub fn buildStreamUrl(allocator: std.mem.Allocator, model: []const u8) ![]const u8 {
         const model_name = if (std.mem.startsWith(u8, model, "models/"))
             model
         else
             try std.fmt.allocPrint(allocator, "models/{s}", .{model});
-
-        if (auth.isApiKey()) {
-            const url = try std.fmt.allocPrint(
-                allocator,
-                "{s}/{s}:streamGenerateContent?key={s}&alt=sse",
-                .{ BASE_URL, model_name, auth.credential() },
-            );
-            if (!std.mem.startsWith(u8, model, "models/")) {
-                allocator.free(@constCast(model_name));
-            }
-            return url;
-        } else {
-            const url = try std.fmt.allocPrint(
-                allocator,
-                "{s}/{s}:streamGenerateContent?alt=sse",
-                .{ BASE_URL, model_name },
-            );
-            if (!std.mem.startsWith(u8, model, "models/")) {
-                allocator.free(@constCast(model_name));
-            }
-            return url;
-        }
+        defer if (!std.mem.startsWith(u8, model, "models/")) allocator.free(@constCast(model_name));
+        return std.fmt.allocPrint(allocator, "{s}/{s}:streamGenerateContent?alt=sse", .{ BASE_URL, model_name });
     }
 
     /// Build a Gemini generateContent request body.
@@ -723,7 +690,10 @@ pub const GeminiProvider = struct {
 
         const data = trimmed[prefix.len..];
 
-        const content = try extractGeminiDelta(allocator, data) orelse return .skip;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch
+            return error.InvalidSseJson;
+        defer parsed.deinit();
+        const content = try extractGeminiDeltaValue(allocator, parsed.value) orelse return .skip;
         return .{ .delta = content };
     }
 
@@ -734,7 +704,12 @@ pub const GeminiProvider = struct {
             return error.InvalidSseJson;
         defer parsed.deinit();
 
-        const obj = parsed.value.object;
+        return extractGeminiDeltaValue(allocator, parsed.value);
+    }
+
+    fn extractGeminiDeltaValue(allocator: std.mem.Allocator, value: std.json.Value) !?[]const u8 {
+        if (value != .object) return null;
+        const obj = value.object;
         const candidates = obj.get("candidates") orelse return null;
         if (candidates != .array or candidates.array.items.len == 0) return null;
 
@@ -777,32 +752,8 @@ pub const GeminiProvider = struct {
         var argv_buf: [36][]const u8 = undefined;
         var argc: usize = 0;
 
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-s";
-        argc += 1;
-        argv_buf[argc] = "--no-buffer";
-        argc += 1;
-        argv_buf[argc] = sse.curlFailFastArg(allocator);
-        argc += 1;
-
         var timeout_buf: [32]u8 = undefined;
-        if (timeout_secs > 0) {
-            const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch return error.GeminiApiError;
-            argv_buf[argc] = "--max-time";
-            argc += 1;
-            argv_buf[argc] = timeout_str;
-            argc += 1;
-        }
-
-        // Match the generic SSE helper: if the stream goes idle for 60 seconds,
-        // let curl fail fast instead of waiting for the full --max-time budget.
-        sse.appendCurlStallDetectionArgs(argv_buf[0..], &argc);
-
-        argv_buf[argc] = "-X";
-        argc += 1;
-        argv_buf[argc] = "POST";
-        argc += 1;
+        sse.appendCurlStreamBaseArgs(allocator, argv_buf[0..], &argc, &timeout_buf, timeout_secs);
 
         // Add proxy from environment if set
         const proxy = http_util.getProxyFromEnv(allocator) catch null;
@@ -845,111 +796,53 @@ pub const GeminiProvider = struct {
         argv_buf[argc] = url;
         argc += 1;
 
-        var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-
-        try child.spawn();
-
-        if (child.stdin) |stdin_file| {
-            stdin_file.writeAll(body) catch {
-                stdin_file.close();
-                child.stdin = null;
-                _ = child.kill() catch {};
-                _ = child.wait() catch {};
-                return error.GeminiApiError;
-            };
-            stdin_file.close();
-            child.stdin = null;
-        } else {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return error.GeminiApiError;
-        }
+        var child = sse.spawnCurl(allocator, argv_buf[0..argc], body) catch |err| {
+            if (err == error.CurlWriteError) return error.GeminiApiError;
+            return err;
+        };
+        var child_reaped = false;
+        defer if (!child_reaped) sse.stopCurl(&child);
 
         // Read stdout line by line, parse SSE events
         var accumulated: std.ArrayListUnmanaged(u8) = .empty;
         defer accumulated.deinit(allocator);
 
-        var line_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer line_buf.deinit(allocator);
+        var reader = line_reader.Reader.init(allocator, child.stdout.?);
+        defer reader.deinit();
 
         var stream_usage = root.TokenUsage{};
-        const file = child.stdout.?;
-        var read_buf: [4096]u8 = undefined;
-        var saw_done = false;
 
-        outer: while (true) {
-            const n = file.read(&read_buf) catch break;
-            if (n == 0) break;
-
-            for (read_buf[0..n]) |byte| {
-                if (byte == '\n') {
-                    if (extractGeminiUsageFromSseLine(allocator, line_buf.items) catch null) |usage| {
-                        stream_usage = usage;
-                    }
-                    const result = parseGeminiSseLine(allocator, line_buf.items) catch {
-                        line_buf.clearRetainingCapacity();
-                        continue;
-                    };
-                    line_buf.clearRetainingCapacity();
-                    switch (result) {
-                        .delta => |text| {
-                            defer allocator.free(text);
-                            try accumulated.appendSlice(allocator, text);
-                            callback(ctx, root.StreamChunk.textDelta(text));
-                        },
-                        .done => {
-                            saw_done = true;
-                            break :outer;
-                        },
-                        .skip => {},
-                    }
-                } else {
-                    try line_buf.append(allocator, byte);
+        while (try reader.next()) |line| {
+            const trimmed = std_compat.mem.trimRight(u8, line, "\r");
+            if (!std.mem.startsWith(u8, trimmed, "data: ")) continue;
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed[6..], .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+            if (parsed.value.object.get("usageMetadata")) |metadata| {
+                if (parseUsageMetadataValue(metadata)) |usage| {
+                    stream_usage = usage;
                 }
             }
-        }
-
-        // Parse trailing line if stream ended without final newline.
-        if (!saw_done and line_buf.items.len > 0) {
-            if (extractGeminiUsageFromSseLine(allocator, line_buf.items) catch null) |usage| {
-                stream_usage = usage;
+            if (try extractGeminiDeltaValue(allocator, parsed.value)) |delta| {
+                defer allocator.free(delta);
+                try sse.appendStreamOutput(allocator, &accumulated, delta);
+                callback(ctx, root.StreamChunk.textDelta(delta));
             }
-            const trailing = parseGeminiSseLine(allocator, line_buf.items) catch null;
-            line_buf.clearRetainingCapacity();
-            if (trailing) |result| {
-                switch (result) {
-                    .delta => |text| {
-                        defer allocator.free(text);
-                        try accumulated.appendSlice(allocator, text);
-                        callback(ctx, root.StreamChunk.textDelta(text));
-                    },
-                    .done => {},
-                    .skip => {},
-                }
-            }
-        }
-
-        // Drain remaining stdout to prevent deadlock on wait()
-        while (true) {
-            const n = file.read(&read_buf) catch break;
-            if (n == 0) break;
         }
 
         const term = child.wait() catch |err| {
             log.err("curlStreamGemini child.wait failed: {}", .{err});
-            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+            if (root.shouldRecoverPartialStream(accumulated.items.len, false)) {
                 log.warn("curlStreamGemini proceeding despite wait failure after partial stream output", .{});
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
             }
             return error.CurlWaitError;
         };
+        child_reaped = true;
         switch (term) {
             .exited => |code| if (code != 0) {
-                if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                if (root.shouldRecoverPartialStream(accumulated.items.len, false)) {
                     log.warn("curlStreamGemini exit code {d} after partial stream output; returning accumulated output", .{code});
                     callback(ctx, root.StreamChunk.finalChunk());
                     return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
@@ -957,7 +850,7 @@ pub const GeminiProvider = struct {
                 return error.CurlFailed;
             },
             else => {
-                if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                if (root.shouldRecoverPartialStream(accumulated.items.len, false)) {
                     log.warn("curlStreamGemini abnormal termination after partial stream output; returning accumulated output", .{});
                     callback(ctx, root.StreamChunk.finalChunk());
                     return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
@@ -1001,19 +894,16 @@ pub const GeminiProvider = struct {
         const self: *GeminiProvider = @ptrCast(@alignCast(ptr));
         const auth = self.auth orelse return error.CredentialsNotSet;
 
-        const url = try buildUrl(allocator, model, auth);
+        const url = try buildUrl(allocator, model);
         defer allocator.free(url);
 
         const body = try buildRequestBody(allocator, system_prompt, message, temperature);
         defer allocator.free(body);
 
-        const resp_body = if (auth.isApiKey())
-            root.curlPostTimed(allocator, url, body, &.{}, 0) catch |err| return root.preserveCurlTransportError(err, error.GeminiApiError)
-        else blk: {
-            var auth_hdr_buf: [512]u8 = undefined;
-            const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{auth.credential()}) catch return error.GeminiApiError;
-            break :blk root.curlPostTimed(allocator, url, body, &.{auth_hdr}, 0) catch |err| return root.preserveCurlTransportError(err, error.GeminiApiError);
-        };
+        const auth_hdr = try auth.header(allocator);
+        defer allocator.free(auth_hdr);
+        const resp_body = root.curlPostTimed(allocator, url, body, &.{auth_hdr}, 0) catch |err|
+            return root.preserveCurlTransportError(err, error.GeminiApiError);
         defer allocator.free(resp_body);
 
         return parseResponse(allocator, resp_body);
@@ -1029,19 +919,16 @@ pub const GeminiProvider = struct {
         const self: *GeminiProvider = @ptrCast(@alignCast(ptr));
         const auth = self.auth orelse return error.CredentialsNotSet;
 
-        const url = try buildUrl(allocator, model, auth);
+        const url = try buildUrl(allocator, model);
         defer allocator.free(url);
 
         const body = try buildChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
-        const resp_body = if (auth.isApiKey())
-            root.curlPostTimed(allocator, url, body, &.{}, request.timeout_secs) catch |err| return root.preserveCurlTransportError(err, error.GeminiApiError)
-        else blk: {
-            var auth_hdr_buf: [512]u8 = undefined;
-            const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{auth.credential()}) catch return error.GeminiApiError;
-            break :blk root.curlPostTimed(allocator, url, body, &.{auth_hdr}, request.timeout_secs) catch |err| return root.preserveCurlTransportError(err, error.GeminiApiError);
-        };
+        const auth_hdr = try auth.header(allocator);
+        defer allocator.free(auth_hdr);
+        const resp_body = root.curlPostTimed(allocator, url, body, &.{auth_hdr}, request.timeout_secs) catch |err|
+            return root.preserveCurlTransportError(err, error.GeminiApiError);
         defer allocator.free(resp_body);
 
         return try parseChatResponse(allocator, resp_body);
@@ -1089,20 +976,16 @@ pub const GeminiProvider = struct {
         const self: *GeminiProvider = @ptrCast(@alignCast(ptr));
         const auth = self.auth orelse return error.CredentialsNotSet;
 
-        const url = try buildStreamUrl(allocator, model, auth);
+        const url = try buildStreamUrl(allocator, model);
         defer allocator.free(url);
 
         const body = try buildChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
-        const stream_result = if (auth.isApiKey())
-            curlStreamGemini(allocator, url, body, &.{}, request.timeout_secs, callback, callback_ctx)
-        else blk: {
-            var auth_hdr_buf: [512]u8 = undefined;
-            const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{auth.credential()}) catch return error.GeminiApiError;
-            const headers = [_][]const u8{auth_hdr};
-            break :blk curlStreamGemini(allocator, url, body, &headers, request.timeout_secs, callback, callback_ctx);
-        };
+        const auth_hdr = try auth.header(allocator);
+        defer allocator.free(auth_hdr);
+        const headers = [_][]const u8{auth_hdr};
+        const stream_result = curlStreamGemini(allocator, url, body, &headers, request.timeout_secs, callback, callback_ctx);
 
         return stream_result catch |err| {
             if (err == error.CurlWaitError or err == error.CurlFailed) {
@@ -1257,29 +1140,34 @@ test "provider rejects empty key" {
     try std.testing.expect(!std.mem.eql(u8, src, "config"));
 }
 
-test "api key url includes key query param" {
-    const auth = GeminiAuth{ .explicit_key = "api-key-123" };
-    const url = try GeminiProvider.buildUrl(std.testing.allocator, "gemini-2.0-flash", auth);
-    defer std.testing.allocator.free(url);
-    try std.testing.expect(std.mem.indexOf(u8, url, ":generateContent?key=api-key-123") != null);
-}
-
-test "oauth url omits key query param" {
-    const auth = GeminiAuth{ .oauth_token = "ya29.test-token" };
-    const url = try GeminiProvider.buildUrl(std.testing.allocator, "gemini-2.0-flash", auth);
+test "API key is absent from the Gemini request URL" {
+    const url = try GeminiProvider.buildUrl(std.testing.allocator, "gemini-2.0-flash");
     defer std.testing.allocator.free(url);
     try std.testing.expect(std.mem.endsWith(u8, url, ":generateContent"));
     try std.testing.expect(std.mem.indexOf(u8, url, "?key=") == null);
 }
 
-test "model name formatting" {
-    const auth = GeminiAuth{ .explicit_key = "key" };
+test "Gemini API and OAuth credentials become distinct protected headers" {
+    const allocator = std.testing.allocator;
+    const api_header = try (GeminiAuth{ .explicit_key = "api-key-123" }).header(allocator);
+    defer allocator.free(api_header);
+    const oauth_header = try (GeminiAuth{ .oauth_token = "ya29.test-token" }).header(allocator);
+    defer allocator.free(oauth_header);
+    try std.testing.expectEqualStrings("x-goog-api-key: api-key-123", api_header);
+    try std.testing.expectEqualStrings("Authorization: Bearer ya29.test-token", oauth_header);
 
-    const url1 = try GeminiProvider.buildUrl(std.testing.allocator, "gemini-2.0-flash", auth);
+    var prepared = try http_util.prepareCurlHeaderArg(allocator, &.{api_header});
+    defer prepared.deinit(allocator);
+    try std.testing.expect(prepared.uses_temp_file);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.arg.?, "api-key-123") == null);
+}
+
+test "model name formatting" {
+    const url1 = try GeminiProvider.buildUrl(std.testing.allocator, "gemini-2.0-flash");
     defer std.testing.allocator.free(url1);
     try std.testing.expect(std.mem.indexOf(u8, url1, "models/gemini-2.0-flash") != null);
 
-    const url2 = try GeminiProvider.buildUrl(std.testing.allocator, "models/gemini-1.5-pro", auth);
+    const url2 = try GeminiProvider.buildUrl(std.testing.allocator, "models/gemini-1.5-pro");
     defer std.testing.allocator.free(url2);
     try std.testing.expect(std.mem.indexOf(u8, url2, "models/gemini-1.5-pro") != null);
     // Ensure no double "models/" prefix
@@ -1467,8 +1355,7 @@ test "provider getName returns Gemini" {
 }
 
 test "buildUrl with models prefix does not double prefix" {
-    const auth = GeminiAuth{ .explicit_key = "key" };
-    const url = try GeminiProvider.buildUrl(std.testing.allocator, "models/gemini-1.5-pro", auth);
+    const url = try GeminiProvider.buildUrl(std.testing.allocator, "models/gemini-1.5-pro");
     defer std.testing.allocator.free(url);
     try std.testing.expect(std.mem.indexOf(u8, url, "models/models/") == null);
     try std.testing.expect(std.mem.indexOf(u8, url, "models/gemini-1.5-pro") != null);
@@ -1486,16 +1373,15 @@ test "vtable supports_streaming is not null" {
     try std.testing.expect(GeminiProvider.vtable.supports_streaming != null);
 }
 
-test "buildStreamUrl with api key" {
-    const auth = GeminiAuth{ .explicit_key = "api-key-123" };
-    const url = try GeminiProvider.buildStreamUrl(std.testing.allocator, "gemini-2.0-flash", auth);
+test "buildStreamUrl excludes credentials from curl arguments" {
+    const url = try GeminiProvider.buildStreamUrl(std.testing.allocator, "gemini-2.0-flash");
     defer std.testing.allocator.free(url);
-    try std.testing.expect(std.mem.indexOf(u8, url, ":streamGenerateContent?key=api-key-123&alt=sse") != null);
+    try std.testing.expect(std.mem.endsWith(u8, url, ":streamGenerateContent?alt=sse"));
+    try std.testing.expect(std.mem.indexOf(u8, url, "?key=") == null);
 }
 
-test "buildStreamUrl with oauth" {
-    const auth = GeminiAuth{ .oauth_token = "ya29.test-token" };
-    const url = try GeminiProvider.buildStreamUrl(std.testing.allocator, "gemini-2.0-flash", auth);
+test "buildStreamUrl accepts prefixed model" {
+    const url = try GeminiProvider.buildStreamUrl(std.testing.allocator, "models/gemini-2.0-flash");
     defer std.testing.allocator.free(url);
     try std.testing.expect(std.mem.endsWith(u8, url, ":streamGenerateContent?alt=sse"));
     try std.testing.expect(std.mem.indexOf(u8, url, "?key=") == null);

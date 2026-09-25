@@ -369,6 +369,7 @@ pub const ReliableProvider = struct {
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
         .supports_streaming = supportsStreamingImpl,
+        .supportsStreamingTools = supportsStreamingToolsImpl,
         .stream_chat = streamChatImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
@@ -651,6 +652,15 @@ pub const ReliableProvider = struct {
             if (entry.provider.supportsNativeTools()) return true;
         }
         return false;
+    }
+
+    fn supportsStreamingToolsImpl(ptr: *anyopaque) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        if (!self.inner.supportsStreamingTools()) return false;
+        for (self.extras) |entry| {
+            if (!entry.provider.supportsStreamingTools()) return false;
+        }
+        return true;
     }
 
     fn supportsVisionImpl(ptr: *anyopaque) bool {

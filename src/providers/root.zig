@@ -272,9 +272,14 @@ pub const StreamCallback = *const fn (ctx: *anyopaque, chunk: StreamChunk) void;
 pub const StreamChatResult = struct {
     content: ?[]const u8 = null,
     reasoning_content: ?[]const u8 = null,
+    tool_calls: []const ToolCall = &.{},
     usage: TokenUsage = .{},
     model: []const u8 = "",
+    finish_reason: StreamFinishReason = .unknown,
+    tool_fragments: u32 = 0,
 };
+
+pub const StreamFinishReason = enum { unknown, stop, tool_calls, length, content_filter, other };
 
 pub fn shouldRecoverPartialStream(accumulated_len: usize, saw_done: bool) bool {
     return saw_done or accumulated_len > 0;
@@ -304,6 +309,8 @@ pub fn emitChatResponseAsStream(
 ) StreamChatResult {
     const reasoning_content = response.reasoning_content;
     response.reasoning_content = null;
+    const tool_calls = response.tool_calls;
+    response.tool_calls = &.{};
     if (response.content) |content| {
         if (content.len > 0) {
             callback(callback_ctx, StreamChunk.textDelta(content));
@@ -314,6 +321,7 @@ pub fn emitChatResponseAsStream(
     return .{
         .content = response.content,
         .reasoning_content = reasoning_content,
+        .tool_calls = tool_calls,
         .usage = response.usage,
         .model = response.model,
     };
@@ -409,6 +417,8 @@ pub const Provider = struct {
         chat_with_tools: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, req: ChatRequest) anyerror!ChatResponse = null,
         /// Optional: returns true if provider supports streaming. Default: false.
         supports_streaming: ?*const fn (ptr: *anyopaque) bool = null,
+        /// Native tool calls can be decoded from this provider's streaming response.
+        supportsStreamingTools: ?*const fn (ptr: *anyopaque) bool = null,
         /// Optional: returns true if provider supports vision/image input. Default: false.
         supports_vision: ?*const fn (ptr: *anyopaque) bool = null,
         /// Optional: returns true if provider supports vision for a specific model.
@@ -467,6 +477,11 @@ pub const Provider = struct {
     /// Returns true if provider supports streaming.
     pub fn supportsStreaming(self: Provider) bool {
         if (self.vtable.supports_streaming) |f| return f(self.ptr);
+        return false;
+    }
+
+    pub fn supportsStreamingTools(self: Provider) bool {
+        if (self.vtable.supportsStreamingTools) |f| return f(self.ptr);
         return false;
     }
 
@@ -855,7 +870,7 @@ test "ChatResponse deinit resets owned fields" {
     try std.testing.expectEqualStrings("", response.model);
 }
 
-test "emitChatResponseAsStream frees unused chat response fields" {
+test "emitChatResponseAsStream retains tool calls for the agent" {
     const allocator = std.testing.allocator;
 
     var tool_calls = try allocator.alloc(ToolCall, 1);
@@ -893,6 +908,14 @@ test "emitChatResponseAsStream frees unused chat response fields" {
     defer if (result.content) |content| allocator.free(content);
     defer if (result.reasoning_content) |reasoning| allocator.free(reasoning);
     defer if (result.model.len > 0) allocator.free(result.model);
+    defer {
+        for (result.tool_calls) |call| {
+            allocator.free(call.id);
+            allocator.free(call.name);
+            allocator.free(call.arguments);
+        }
+        allocator.free(result.tool_calls);
+    }
 
     try std.testing.expectEqual(@as(usize, 1), ctx.text_count);
     try std.testing.expect(ctx.saw_final);
@@ -902,6 +925,8 @@ test "emitChatResponseAsStream frees unused chat response fields" {
     try std.testing.expectEqualStrings("hello", result.content.?);
     try std.testing.expectEqualStrings("private reasoning", result.reasoning_content.?);
     try std.testing.expectEqualStrings("test-model", result.model);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("read_file", result.tool_calls[0].name);
 }
 
 test "Provider.streamChat fallback emits single chunk and final" {

@@ -158,6 +158,7 @@ pub const RouterProvider = struct {
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
         .supports_streaming = supportsStreamingImpl,
+        .supportsStreamingTools = supportsStreamingToolsImpl,
         .stream_chat = streamChatImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
@@ -222,6 +223,15 @@ pub const RouterProvider = struct {
         const provider_idx = resolved[0];
         if (provider_idx >= self.providers.len) return false;
         return self.providers[provider_idx].supportsNativeTools();
+    }
+
+    fn supportsStreamingToolsImpl(ptr: *anyopaque) bool {
+        const self: *RouterProvider = @ptrCast(@alignCast(ptr));
+        if (self.providers.len == 0) return false;
+        for (self.providers) |target| {
+            if (!target.supportsStreamingTools()) return false;
+        }
+        return true;
     }
 
     fn supportsVisionImpl(ptr: *anyopaque) bool {
