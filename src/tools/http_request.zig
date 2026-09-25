@@ -224,7 +224,7 @@ fn runNativeRequestWithStatus(
         header_lines[header_count] = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ header[0], header[1] });
         header_count += 1;
     }
-    const proxy = try http_util.getProxyFromEnv(allocator);
+    const proxy = try http_util.getProxyForUrl(allocator, url);
     defer if (proxy) |value| allocator.free(value);
     var response = try native_http.perform(allocator, .{
         .method = native_method,

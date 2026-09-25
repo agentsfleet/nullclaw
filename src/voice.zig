@@ -370,7 +370,7 @@ fn curlPostFromFile(
     var upload = file;
     const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
     defer if (resolve_entry) |entry| allocator.free(entry);
-    const proxy = try http_util.getProxyFromEnv(allocator);
+    const proxy = try http_util.getProxyForUrl(allocator, url);
     defer if (proxy) |value| allocator.free(value);
     var response = try native_http.perform(allocator, .{
         .method = .post,
@@ -636,6 +636,81 @@ test "voice writeMultipartToTempFile refuses to overwrite existing file" {
     const content = try target_file.readToEndAlloc(allocator, 64);
     defer allocator.free(content);
     try std.testing.expectEqualStrings("existing", content);
+}
+
+test "voice file upload sends exact multipart bytes and closes on interruption" {
+    // Regression: the native file source must preserve the multipart body and
+    // release its file handle when a running request is canceled.
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const path = try std.fmt.allocPrint(allocator, "{s}/multipart.bin", .{base});
+    defer allocator.free(path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const body = try buildMultipartBody(allocator, "testboundary", "audio-bytes", .{});
+    defer allocator.free(body);
+    {
+        const file = try std_compat.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(body);
+    }
+
+    const address = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try address.listen(.{});
+    defer server.deinit();
+    const Upload = struct {
+        server: *std_compat.net.Server,
+        expected: []const u8,
+        matched: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(self: *@This()) void {
+            var connection = self.server.accept() catch return;
+            defer connection.stream.close();
+            var request: [8192]u8 = undefined;
+            var used: usize = 0;
+            while (used < request.len) {
+                const count = connection.stream.read(request[used..]) catch return;
+                if (count == 0) return;
+                used += count;
+                const end = std.mem.indexOf(u8, request[0..used], "\r\n\r\n") orelse continue;
+                const body_start = end + 4;
+                if (used < body_start + self.expected.len) continue;
+                const head = request[0..body_start];
+                const received = request[body_start .. body_start + self.expected.len];
+                self.matched.store(std.mem.startsWith(u8, head, "POST /upload ") and
+                    std.mem.indexOf(u8, head, "Content-Type: multipart/form-data; boundary=testboundary") != null and
+                    std.mem.eql(u8, received, self.expected), .release);
+                connection.stream.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok") catch {};
+                return;
+            }
+        }
+    };
+    var upload = Upload{ .server = &server, .expected = body };
+    var thread = try std.Thread.spawn(.{}, Upload.run, .{&upload});
+    var joined = false;
+    defer if (!joined) {
+        var connection = std_compat.net.tcpConnectToAddress(server.listen_address) catch null;
+        if (connection) |*stream| stream.close();
+        thread.join();
+    };
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/upload", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+    const response = try curlPostFromFile(allocator, url, path_z, &.{"Content-Type: multipart/form-data; boundary=testboundary"});
+    defer allocator.free(response);
+    thread.join();
+    joined = true;
+    try std.testing.expectEqualStrings("ok", response);
+    try std.testing.expect(upload.matched.load(.acquire));
+
+    var interrupted = std.atomic.Value(bool).init(true);
+    http_util.setThreadInterruptFlag(&interrupted);
+    defer http_util.setThreadInterruptFlag(null);
+    try std.testing.expectError(error.CurlInterrupted, curlPostFromFile(allocator, url, path_z, &.{}));
+    try std_compat.fs.deleteFileAbsolute(path);
 }
 
 test "voice parseTranscriptionText valid" {

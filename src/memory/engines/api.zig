@@ -156,7 +156,7 @@ pub const ApiMemory = struct {
         }
         const resolve_entry = http_util.buildSafeResolveEntryForRemoteUrl(alloc, url) catch return error.ApiConnectionError;
         defer if (resolve_entry) |entry| alloc.free(entry);
-        const proxy = try http_util.getProxyFromEnv(alloc);
+        const proxy = try http_util.getProxyForUrl(alloc, url);
         defer if (proxy) |value| alloc.free(value);
         const timeout_secs: u64 = @max(1, (@as(u64, self.timeout_ms) + 999) / 1000);
         var response = native_http.perform(alloc, .{

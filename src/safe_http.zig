@@ -29,12 +29,42 @@ const LimitedSink = struct {
     }
 };
 
+fn remainingTimeoutSeconds(timeout_secs: u64, started_ns: i128, now_ns: i128) !u64 {
+    const limit_ns: i128 = @as(i128, timeout_secs) * std.time.ns_per_s;
+    const elapsed = @max(0, now_ns - started_ns);
+    if (elapsed >= limit_ns) return error.CurlTimeout;
+    return @intCast(@max(1, @divTrunc(limit_ns - elapsed + std.time.ns_per_s - 1, std.time.ns_per_s)));
+}
+
+test "limited file sink rejects bytes before exceeding its response cap" {
+    const Sink = struct {
+        written: usize = 0,
+
+        fn onBytes(ptr: *anyopaque, bytes: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.written += bytes.len;
+            return true;
+        }
+    };
+    var sink = Sink{};
+    var limited = LimitedSink{ .downstream = Sink.onBytes, .context = &sink, .limit = 4 };
+    try std.testing.expect(try LimitedSink.onBytes(&limited, "ab"));
+    try std.testing.expect(try LimitedSink.onBytes(&limited, "cd"));
+    try std.testing.expectError(error.ResponseTooLarge, LimitedSink.onBytes(&limited, "e"));
+    try std.testing.expectEqual(@as(usize, 4), sink.written);
+}
+
+test "redirect timeout uses one remaining budget across hops" {
+    try std.testing.expectEqual(@as(u64, 3), try remainingTimeoutSeconds(5, 0, 2 * std.time.ns_per_s));
+    try std.testing.expectEqual(@as(u64, 1), try remainingTimeoutSeconds(5, 0, 4 * std.time.ns_per_s + 1));
+    try std.testing.expectError(error.CurlTimeout, remainingTimeoutSeconds(5, 0, 5 * std.time.ns_per_s));
+}
+
 pub fn get(allocator: std.mem.Allocator, initial_url: []const u8, options: GetOptions) !native_http.Response {
     if (options.sink != null and options.sink_ctx == null) return error.MissingBodySinkContext;
     var current = try allocator.dupe(u8, initial_url);
     defer allocator.free(current);
-    const started = compat.time.nanoTimestamp();
-    const limit_ns: i128 = @as(i128, options.timeout_secs) * std.time.ns_per_s;
+    const started = std.Io.Clock.now(.awake, compat.io()).nanoseconds;
     var limited: LimitedSink = undefined;
     if (options.sink) |sink| limited = .{
         .downstream = sink,
@@ -54,11 +84,10 @@ pub fn get(allocator: std.mem.Allocator, initial_url: []const u8, options: GetOp
         else
             null;
         defer if (pin) |entry| allocator.free(entry);
-        const proxy = try http_util.getProxyFromEnv(allocator);
+        const proxy = try http_util.getProxyForUrl(allocator, current);
         defer if (proxy) |value| allocator.free(value);
-        const elapsed = @max(0, compat.time.nanoTimestamp() - started);
-        if (elapsed >= limit_ns) return error.CurlTimeout;
-        const remaining: u64 = @intCast(@max(1, @divTrunc(limit_ns - elapsed + std.time.ns_per_s - 1, std.time.ns_per_s)));
+        const now = std.Io.Clock.now(.awake, compat.io()).nanoseconds;
+        const remaining = try remainingTimeoutSeconds(options.timeout_secs, started, now);
         var response = try native_http.perform(allocator, .{
             .method = .get,
             .url = current,

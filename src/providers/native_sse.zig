@@ -87,7 +87,7 @@ pub fn postJsonWithOptions(
     for (headers, 0..) |header, i| all_headers[i + 1] = header;
     const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
     defer if (resolve_entry) |entry| allocator.free(entry);
-    const proxy = try http_util.getProxyFromEnv(allocator);
+    const proxy = try http_util.getProxyForUrl(allocator, url);
     defer if (proxy) |value| allocator.free(value);
     var state = StreamState{ .reader = line_reader.FeedReader.init(allocator), .ctx = ctx, .on_line = on_line };
     defer state.reader.deinit();

@@ -145,6 +145,37 @@ test "response headers are bounded even when the caller does not capture them" {
     try std.testing.expectEqual(error.ResponseHeadersTooLarge, state.failure.?);
 }
 
+test "file sink never receives an HTTP error page" {
+    // Regression: updater downloads must not write a 4xx page into .partial.
+    const Sink = struct {
+        written: usize = 0,
+
+        fn onBytes(ptr: *anyopaque, bytes: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.written += bytes.len;
+            return true;
+        }
+    };
+    var sink = Sink{};
+    var state = State{
+        .allocator = std.testing.allocator,
+        .max_body_bytes = 4,
+        .capture_headers = false,
+        .sink = Sink.onBytes,
+        .sink_ctx = &sink,
+        .sink_success_only = true,
+        .response_status = 404,
+        .body_file = null,
+        .interrupt_flag = null,
+    };
+    var page = [_]u8{ 'n', 'o' };
+    try std.testing.expectEqual(@as(usize, 2), onBody(page[0..].ptr, 1, page.len, &state));
+    try std.testing.expectEqual(@as(usize, 0), sink.written);
+    state.response_status = 200;
+    try std.testing.expectEqual(@as(usize, 2), onBody(page[0..].ptr, 1, page.len, &state));
+    try std.testing.expectEqual(@as(usize, 2), sink.written);
+}
+
 fn onRead(ptr: [*c]u8, size: usize, count: usize, context: ?*anyopaque) callconv(.c) usize {
     const state: *State = @ptrCast(@alignCast(context orelse return curl.CURL_READFUNC_ABORT));
     const len = std.math.mul(usize, size, count) catch return curl.CURL_READFUNC_ABORT;

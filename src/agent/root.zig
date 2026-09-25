@@ -52,6 +52,47 @@ const ToolExecutionResult = dispatcher.ToolExecutionResult;
 const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 25;
 const MAX_MID_TURN_INJECTION_FOLLOWUPS: u32 = 8;
 
+/// The embedded fleet runner forwards only provider-typed text from native
+/// tool passes. Prompt-tool passes are classified after the full response;
+/// exposing their intermediate bytes could show tool arguments or results.
+const SafeStreamGate = struct {
+    target: providers.StreamCallback,
+    ctx: *anyopaque,
+    native_tools_enabled: bool,
+
+    fn forward(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+        const self: *SafeStreamGate = @ptrCast(@alignCast(ctx));
+        if (self.native_tools_enabled and chunk.kind != .untrusted and !chunk.is_final)
+            self.target(self.ctx, chunk);
+    }
+};
+
+test "embedded stream gate forwards typed native text and withholds prompt-tool bytes" {
+    const Sink = struct {
+        answer: usize = 0,
+        reasoning: usize = 0,
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (chunk.kind) {
+                .answer => self.answer += chunk.delta.len,
+                .reasoning => self.reasoning += chunk.delta.len,
+                .untrusted => unreachable,
+            }
+        }
+    };
+    var sink = Sink{};
+    var native = SafeStreamGate{ .target = Sink.onChunk, .ctx = &sink, .native_tools_enabled = true };
+    SafeStreamGate.forward(&native, providers.StreamChunk.answerDelta("answer"));
+    SafeStreamGate.forward(&native, providers.StreamChunk.reasoningDelta("think"));
+    SafeStreamGate.forward(&native, providers.StreamChunk.textDelta("<tool_result>secret"));
+    SafeStreamGate.forward(&native, providers.StreamChunk.finalChunk());
+    try std.testing.expectEqual(@as(usize, 6), sink.answer);
+    try std.testing.expectEqual(@as(usize, 5), sink.reasoning);
+    var prompt_tools = SafeStreamGate{ .target = Sink.onChunk, .ctx = &sink, .native_tools_enabled = false };
+    SafeStreamGate.forward(&prompt_tools, providers.StreamChunk.answerDelta("hidden"));
+    try std.testing.expectEqual(@as(usize, 6), sink.answer);
+}
+
 /// Maximum non-system messages before trimming.
 const DEFAULT_MAX_HISTORY: u32 = 50;
 
@@ -403,6 +444,9 @@ pub const Agent = struct {
     stream_callback: ?providers.StreamCallback = null,
     /// Context pointer passed to stream_callback.
     stream_ctx: ?*anyopaque = null,
+    /// Only provider-typed answer/reasoning bytes may reach the callback.
+    /// The host still gets the authoritative final text from `turn()`.
+    safe_stream_only: bool = false,
     /// Optional progress hint callback. When set, called on tool_call_start events.
     progress_callback: ?ProgressCallback = null,
     /// Context pointer passed to progress_callback.
@@ -2259,6 +2303,13 @@ pub const Agent = struct {
             var response_attempt: u32 = 1;
             providers.clearLastApiErrorDetail();
             if (is_streaming) {
+                var safe_gate = SafeStreamGate{
+                    .target = self.stream_callback.?,
+                    .ctx = self.stream_ctx.?,
+                    .native_tools_enabled = native_tools_enabled,
+                };
+                const stream_callback = if (self.safe_stream_only) SafeStreamGate.forward else self.stream_callback.?;
+                const stream_ctx = if (self.safe_stream_only) @as(*anyopaque, @ptrCast(&safe_gate)) else self.stream_ctx.?;
                 self.recordLlmRequestEvent(turn_model_name, messages);
                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
                 const stream_result = self.provider.streamChat(
@@ -2276,8 +2327,8 @@ pub const Agent = struct {
                     },
                     turn_model_name,
                     self.temperature,
-                    self.stream_callback.?,
-                    self.stream_ctx.?,
+                    stream_callback,
+                    stream_ctx,
                 ) catch |err| retry_stream: {
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
                     self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
@@ -2313,8 +2364,8 @@ pub const Agent = struct {
                             },
                             turn_model_name,
                             self.temperature,
-                            self.stream_callback.?,
-                            self.stream_ctx.?,
+                            stream_callback,
+                            stream_ctx,
                         ) catch |retry_err| {
                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
                             self.emitUsageFailure(turn_model_name);

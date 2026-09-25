@@ -241,10 +241,13 @@ pub const ChatResponse = struct {
 // ════════════════════════════════════════════════════════════════════════════
 
 /// A single chunk of streamed output.
+pub const StreamChunkKind = enum { untrusted, answer, reasoning };
+
 pub const StreamChunk = struct {
     delta: []const u8,
     is_final: bool,
     token_count: u32,
+    kind: StreamChunkKind = .untrusted,
 
     /// Create a text delta chunk with estimated token count.
     pub fn textDelta(text: []const u8) StreamChunk {
@@ -253,6 +256,20 @@ pub const StreamChunk = struct {
             .is_final = false,
             .token_count = @intCast((text.len + 3) / 4),
         };
+    }
+
+    /// Text from a provider path with structured native tool calls.
+    pub fn answerDelta(text: []const u8) StreamChunk {
+        var chunk = textDelta(text);
+        chunk.kind = .answer;
+        return chunk;
+    }
+
+    /// Reasoning from a dedicated provider field, never inferred from markup.
+    pub fn reasoningDelta(text: []const u8) StreamChunk {
+        var chunk = textDelta(text);
+        chunk.kind = .reasoning;
+        return chunk;
     }
 
     /// Create a final (end-of-stream) chunk.

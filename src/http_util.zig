@@ -223,7 +223,6 @@ const proxy_env_var_names = [_][]const u8{
 };
 const http_proxy_env_var_names = [_][]const u8{
     "http_proxy",
-    "HTTP_PROXY",
     "all_proxy",
     "ALL_PROXY",
 };
@@ -428,12 +427,14 @@ fn nativeRequest(
         std.fmt.parseInt(u64, value, 10) catch return error.CurlFailed
     else
         null;
+    const configured_proxy = if (proxy == null) try getProxyForUrl(allocator, url) else null;
+    defer if (configured_proxy) |value| allocator.free(value);
     var response = try native_http.perform(allocator, .{
         .method = method,
         .url = url,
         .body = body,
         .headers = all_headers[0 .. headers.len + additional],
-        .proxy = proxy,
+        .proxy = proxy orelse configured_proxy,
         .resolve_entry = resolve_entry,
         .timeout_secs = timeout,
         .max_body_bytes = max_body_bytes,
@@ -472,7 +473,7 @@ fn curlRequestWithProxy(
     return bodyOnly(allocator, response);
 }
 
-/// HTTP POST via in-process libcurl (no proxy, no timeout).
+/// HTTP POST via in-process libcurl, using configured proxy settings.
 pub fn curlPost(allocator: Allocator, url: []const u8, body: []const u8, headers: []const []const u8) ![]u8 {
     return curlPostWithProxy(allocator, url, body, headers, null, null);
 }
@@ -574,7 +575,7 @@ pub fn curlGetWithStatusAndTimeoutAndResolve(
     return .{ .status_code = response.status, .body = bodyOnly(allocator, response) };
 }
 
-/// HTTP PUT via in-process libcurl (no proxy, no timeout).
+/// HTTP PUT via in-process libcurl, using configured proxy settings.
 pub fn curlPut(allocator: Allocator, url: []const u8, body: []const u8, headers: []const []const u8) ![]u8 {
     return curlRequestWithProxy(
         allocator,
@@ -633,7 +634,7 @@ pub fn curlGetWithResolve(
     return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, null, resolve_entry, DEFAULT_CURL_GET_MAX_BYTES);
 }
 
-/// HTTP GET via in-process libcurl (no proxy).
+/// HTTP GET via in-process libcurl, using configured proxy settings.
 pub fn curlGet(allocator: Allocator, url: []const u8, headers: []const []const u8, timeout_secs: []const u8) ![]u8 {
     return curlGetWithProxy(allocator, url, headers, timeout_secs, null);
 }
@@ -649,11 +650,9 @@ pub fn curlGetMaxBytes(
     return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, null, null, max_bytes);
 }
 
-/// Read proxy URL from standard environment variables.
-/// Checks https_proxy/HTTPS_PROXY first, then http_proxy/HTTP_PROXY,
-/// then all_proxy/ALL_PROXY.
-/// Returns null if no proxy is set.
-/// Caller owns returned memory.
+/// Process-wide proxy override and scheme-specific environment lookup.
+/// Uppercase HTTP_PROXY is ignored for HTTP requests, matching libcurl's CGI
+/// safety rule. Caller owns a returned proxy string.
 var proxy_override_value: ?[]u8 = null;
 var proxy_override_mutex: std_compat.sync.Mutex = .{};
 
@@ -749,7 +748,7 @@ pub fn initClientDefaultProxies(client: *std.http.Client, arena: Allocator) !voi
     try client.initDefaultProxies(arena, &env_map);
 }
 
-pub fn getProxyFromEnv(allocator: Allocator) !?[]const u8 {
+fn getProxyFromProcess(allocator: Allocator, env_vars: []const []const u8) !?[]const u8 {
     const override = blk: {
         proxy_override_mutex.lock();
         defer proxy_override_mutex.unlock();
@@ -757,12 +756,27 @@ pub fn getProxyFromEnv(allocator: Allocator) !?[]const u8 {
         break :blk null;
     };
     if (override) |value| return value;
-    for (https_proxy_env_var_names ++ http_proxy_env_var_names) |key| {
+    for (env_vars) |key| {
         const raw = std_compat.process.getEnvVarOwned(allocator, key) catch continue;
         defer allocator.free(raw);
         if (try normalizeProxyEnvValue(allocator, raw)) |value| return value;
     }
     return null;
+}
+
+pub fn getProxyFromEnv(allocator: Allocator) !?[]const u8 {
+    return getProxyFromProcess(allocator, &(https_proxy_env_var_names ++ http_proxy_env_var_names));
+}
+
+fn proxyEnvNamesForUrl(url: []const u8) ![]const []const u8 {
+    const uri = std.Uri.parse(url) catch return error.InvalidUrl;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return &https_proxy_env_var_names;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) return &http_proxy_env_var_names;
+    return error.InvalidUrl;
+}
+
+pub fn getProxyForUrl(allocator: Allocator, url: []const u8) !?[]const u8 {
+    return getProxyFromProcess(allocator, try proxyEnvNamesForUrl(url));
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -1120,6 +1134,61 @@ test "setProxyOverride applies and clears process-wide override" {
     }
 }
 
+test "buffered request with a DNS pin uses the configured proxy" {
+    // Regression: a null explicit proxy disabled the environment override for
+    // pinned provider calls, so they dialed outside the configured proxy.
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const address = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try address.listen(.{});
+    defer server.deinit();
+    const Proxy = struct {
+        server: *std_compat.net.Server,
+        saw_pin: AtomicBool = AtomicBool.init(false),
+
+        fn readHeaders(stream: std_compat.net.Stream, buf: *[4096]u8) ![]const u8 {
+            var used: usize = 0;
+            while (used < buf.len) {
+                const count = try stream.read(buf[used..]);
+                if (count == 0) return error.TestUnexpectedResult;
+                used += count;
+                if (std.mem.indexOf(u8, buf[0..used], "\r\n\r\n") != null) return buf[0..used];
+            }
+            return error.TestUnexpectedResult;
+        }
+
+        fn run(self: *@This()) void {
+            var connection = self.server.accept() catch return;
+            defer connection.stream.close();
+            var first: [4096]u8 = undefined;
+            const connect = readHeaders(connection.stream, &first) catch return;
+            if (!std.mem.startsWith(u8, connect, "CONNECT 203.0.113.9:80 ")) return;
+            self.saw_pin.store(true, .release);
+            connection.stream.writeAll("HTTP/1.1 200 Connection established\r\n\r\n") catch return;
+            var second: [4096]u8 = undefined;
+            _ = readHeaders(connection.stream, &second) catch return;
+            connection.stream.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok") catch {};
+        }
+    };
+    var proxy_server = Proxy{ .server = &server };
+    var thread = try std.Thread.spawn(.{}, Proxy.run, .{&proxy_server});
+    var joined = false;
+    defer if (!joined) {
+        unblockCredentialedNativeServer(&server);
+        thread.join();
+    };
+    const proxy_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{server.listen_address.in.getPort()});
+    defer allocator.free(proxy_url);
+    try setProxyOverride(proxy_url);
+    defer setProxyOverride(null) catch unreachable;
+    const body = try curlGetWithResolve(allocator, "http://pinned.test:80/", &.{}, "5", "pinned.test:80:203.0.113.9");
+    defer allocator.free(body);
+    thread.join();
+    joined = true;
+    try std.testing.expectEqualStrings("ok", body);
+    try std.testing.expect(proxy_server.saw_pin.load(.acquire));
+}
+
 test "setProxyOverride accepts long proxy URLs" {
     const allocator = std.testing.allocator;
     var long_proxy = try allocator.alloc(u8, 1600);
@@ -1149,6 +1218,32 @@ test "getProxyFromEnvMap honors lowercase https_proxy before http_proxy" {
 
     try std.testing.expect(proxy != null);
     try std.testing.expectEqualStrings("https://secure.example:8443", proxy.?);
+}
+
+test "proxy lookup selects HTTP and HTTPS environment variables by URL" {
+    var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("http_proxy", "http://http-proxy.example:8080");
+    try env_map.put("https_proxy", "http://https-proxy.example:8443");
+    try env_map.put("all_proxy", "http://fallback-proxy.example:8888");
+    const http = try getProxyFromEnvMap(std.testing.allocator, &env_map, try proxyEnvNamesForUrl("http://example.com/"));
+    defer if (http) |value| std.testing.allocator.free(value);
+    const https = try getProxyFromEnvMap(std.testing.allocator, &env_map, try proxyEnvNamesForUrl("https://example.com/"));
+    defer if (https) |value| std.testing.allocator.free(value);
+    try std.testing.expectEqualStrings("http://http-proxy.example:8080", http.?);
+    try std.testing.expectEqualStrings("http://https-proxy.example:8443", https.?);
+    try std.testing.expectError(error.InvalidUrl, proxyEnvNamesForUrl("ftp://example.com/"));
+}
+
+test "HTTP proxy lookup ignores uppercase HTTP_PROXY" {
+    // CGI can place a request header in HTTP_PROXY; libcurl intentionally
+    // ignores that environment variable for HTTP requests.
+    var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("HTTP_PROXY", "http://untrusted.example:8080");
+    const proxy = try getProxyFromEnvMap(std.testing.allocator, &env_map, try proxyEnvNamesForUrl("http://example.com/"));
+    defer if (proxy) |value| std.testing.allocator.free(value);
+    try std.testing.expect(proxy == null);
 }
 
 test "applyProxyOverrideToEnvMap overwrites existing proxy values" {

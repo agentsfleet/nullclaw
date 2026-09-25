@@ -331,7 +331,7 @@ fn buildSimpleCodexBody(
 
 // ── SSE / HTTP ───────────────────────────────────────────────────────────
 
-/// Non-streaming Codex request — spawns curl with SSE, accumulates text deltas, returns final text.
+/// Non-streaming Codex request uses the same bounded stream accumulator.
 fn codexRequest(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -340,28 +340,12 @@ fn codexRequest(
     extra_headers: []const []const u8,
     timeout_secs: u64,
 ) ![]const u8 {
-    // Use the streaming path internally and just accumulate
-    var accumulated: std.ArrayListUnmanaged(u8) = .empty;
-    defer accumulated.deinit(allocator);
-
-    const NoopCtx = struct {
-        list: *std.ArrayListUnmanaged(u8),
-        alloc: std.mem.Allocator,
-
-        fn callback(ctx: *anyopaque, chunk: root.StreamChunk) void {
-            if (chunk.is_final) return;
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.list.appendSlice(self.alloc, chunk.delta) catch {};
-        }
+    const Ignore = struct {
+        fn callback(_: *anyopaque, _: root.StreamChunk) void {}
     };
-
-    var ctx = NoopCtx{ .list = &accumulated, .alloc = allocator };
-    _ = codexStreamRequest(allocator, url, body, auth_header, extra_headers, timeout_secs, NoopCtx.callback, @ptrCast(&ctx)) catch |err| {
-        return err;
-    };
-
-    if (accumulated.items.len == 0) return error.NoResponseContent;
-    return try allocator.dupe(u8, accumulated.items);
+    var marker: u8 = 0;
+    const result = try codexStreamRequest(allocator, url, body, auth_header, extra_headers, timeout_secs, Ignore.callback, &marker);
+    return result.content orelse error.NoResponseContent;
 }
 
 const CodexStreamState = struct {
@@ -434,7 +418,7 @@ const CodexStreamState = struct {
     }
 
     fn emit(self: *CodexStreamState, text: []const u8) !void {
-        try self.accumulated.appendSlice(self.allocator, text);
+        try sse.appendStreamOutput(self.allocator, &self.accumulated, text);
         self.callback(self.callback_ctx, root.StreamChunk.textDelta(text));
     }
 };
@@ -1230,6 +1214,32 @@ test "effectiveCodexStallTimeoutSecs caps long request timeout" {
     try std.testing.expectEqual(@as(u64, 90), effectiveCodexStallTimeoutSecs(600));
     try std.testing.expectEqual(@as(u64, 30), effectiveCodexStallTimeoutSecs(30));
     try std.testing.expectEqual(@as(u64, 90), effectiveCodexStallTimeoutSecs(0));
+}
+
+test "Codex stream rejects many small deltas beyond the shared output cap" {
+    // Regression: a bounded SSE line still permitted unbounded cumulative text.
+    const Counter = struct {
+        count: usize = 0,
+
+        fn onChunk(ctx: *anyopaque, _: root.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+        }
+    };
+    var counter = Counter{};
+    var state = CodexStreamState{
+        .allocator = std.testing.allocator,
+        .callback = Counter.onChunk,
+        .callback_ctx = &counter,
+    };
+    defer state.accumulated.deinit(std.testing.allocator);
+    const delta: [4096]u8 = @splat('x');
+    for (0..1024) |_| try state.emit(&delta);
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), state.accumulated.items.len);
+    try std.testing.expectEqual(@as(usize, 1024), counter.count);
+    try std.testing.expectError(error.StreamOutputTooLarge, state.emit("x"));
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), state.accumulated.items.len);
+    try std.testing.expectEqual(@as(usize, 1024), counter.count);
 }
 
 test "codexDeltaSourceEndsStream treats completed events as terminal" {

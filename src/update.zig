@@ -289,6 +289,14 @@ fn findAssetUrl(allocator: std.mem.Allocator, asset_name: []const u8) ?[]const u
 
 // ── Download & Install ────────────────────────────────────────────────
 
+fn cleanupPartialFile(file: *std_compat.fs.File, closed: *bool, path: []const u8) void {
+    if (!closed.*) {
+        file.close();
+        closed.* = true;
+    }
+    std_compat.fs.deleteFileAbsolute(path) catch {};
+}
+
 fn downloadAndInstall(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -304,13 +312,7 @@ fn downloadAndInstall(
     var tmp_file = try std_compat.fs.createFileAbsolute(tmp_path, .{ .read = true });
     var tmp_closed = false;
     defer if (!tmp_closed) tmp_file.close();
-    errdefer {
-        if (!tmp_closed) {
-            tmp_file.close();
-            tmp_closed = true;
-        }
-        std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
-    }
+    errdefer cleanupPartialFile(&tmp_file, &tmp_closed, tmp_path);
 
     // Download directly to file (streaming, no memory buffer limit)
     const bytes_downloaded = downloadToFile(allocator, url, &tmp_file) catch |err| {
@@ -445,4 +447,22 @@ test "downloadToFile rejects non-HTTPS URLs before writing" {
     defer dst_file.close();
     try std.testing.expectError(error.UnsupportedScheme, downloadToFile(std.testing.allocator, "file:///tmp/update.bin", &dst_file));
     try std.testing.expectEqual(@as(u64, 0), (try dst_file.stat()).size);
+}
+
+test "failed update cleanup closes and removes its partial file" {
+    // Regression: a failed download must not leave an executable-looking
+    // partial file beside the installed binary.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const base = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const partial_path = try std.fmt.allocPrint(allocator, "{s}/nullclaw-test.partial", .{base});
+    defer allocator.free(partial_path);
+    var file = try std_compat.fs.createFileAbsolute(partial_path, .{});
+    try file.writeAll("partial executable bytes");
+    var closed = false;
+    cleanupPartialFile(&file, &closed, partial_path);
+    try std.testing.expect(closed);
+    try std.testing.expectError(error.FileNotFound, std_compat.fs.openFileAbsolute(partial_path, .{}));
 }

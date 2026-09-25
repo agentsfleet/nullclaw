@@ -124,7 +124,7 @@ fn appendDeltaContent(
         .text => |text| {
             try closeReasoningBlock(allocator, accumulated, in_reasoning, callback, ctx);
             try appendStreamOutput(allocator, accumulated, text);
-            callback(ctx, root.StreamChunk.textDelta(text));
+            callback(ctx, root.StreamChunk.answerDelta(text));
         },
         .reasoning => |reasoning| {
             if (!in_reasoning.*) {
@@ -133,7 +133,7 @@ fn appendDeltaContent(
                 callback(ctx, root.StreamChunk.textDelta(THINK_OPEN_TAG));
             }
             try appendStreamOutput(allocator, accumulated, reasoning);
-            callback(ctx, root.StreamChunk.textDelta(reasoning));
+            callback(ctx, root.StreamChunk.reasoningDelta(reasoning));
         },
     }
 }
@@ -153,20 +153,7 @@ fn parseSseLineWithTools(
     line: []const u8,
     collector: ?*stream_tools.Collector,
 ) !SseLineResult {
-    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
-
-    if (trimmed.len == 0) return .skip;
-    if (trimmed[0] == ':') return .skip;
-
-    // SSE uses "data:" with an optional single leading space before the value.
-    const prefix = "data:";
-    if (!std.mem.startsWith(u8, trimmed, prefix)) return .skip;
-
-    const data = if (trimmed.len > prefix.len and trimmed[prefix.len] == ' ')
-        trimmed[prefix.len + 1 ..]
-    else
-        trimmed[prefix.len..];
-
+    const data = openAiDataPayload(line) orelse return .skip;
     if (data.len == 0) return .skip;
 
     if (std.mem.eql(u8, data, "[DONE]")) return .done;
@@ -184,6 +171,13 @@ fn parseSseLineWithTools(
         return .skip;
     };
     return .{ .delta = content };
+}
+
+fn openAiDataPayload(line: []const u8) ?[]const u8 {
+    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
+    if (!std.mem.startsWith(u8, trimmed, "data:")) return null;
+    const value = trimmed[5..];
+    return if (std.mem.startsWith(u8, value, " ")) value[1..] else value;
 }
 
 /// Extract `usage` object from an OpenAI-compatible streaming chunk.
@@ -380,6 +374,14 @@ const OpenAiStream = struct {
         self.first_line = false;
         const result = parseSseLineWithTools(self.allocator, line, if (self.metadata_error == null) &self.tools else null) catch |err| {
             if (err == error.OutOfMemory) return err;
+            // Plain-text provider heartbeats can be skipped before tool
+            // assembly. A malformed JSON object might be a tool argument
+            // fragment, so it must fail the turn rather than alter a call.
+            if (err == error.InvalidSseJson and self.tools.count == 0) {
+                if (openAiDataPayload(line)) |data| {
+                    if (data.len > 0 and data[0] != '{' and data[0] != '[') return true;
+                }
+            }
             if (self.metadata_error == null) self.metadata_error = err;
             return true;
         };
@@ -398,6 +400,34 @@ const OpenAiStream = struct {
         return true;
     }
 };
+
+test "OpenAI stream skips plain-text heartbeat frames after visible deltas" {
+    const Ignore = struct {
+        fn onChunk(_: *anyopaque, _: root.StreamChunk) void {}
+    };
+    var marker: u8 = 0;
+    var stream = OpenAiStream{ .allocator = std.testing.allocator, .callback = Ignore.onChunk, .ctx = &marker };
+    defer stream.deinit();
+    try std.testing.expect(try OpenAiStream.onLine(&stream, "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}"));
+    try std.testing.expect(try OpenAiStream.onLine(&stream, "data: heartbeat"));
+    try std.testing.expect(try OpenAiStream.onLine(&stream, "data:heartbeat"));
+    try std.testing.expect(try OpenAiStream.onLine(&stream, "data: {\"choices\":[{\"delta\":{\"content\":\" second\"}}]}"));
+    try std.testing.expect(!(try OpenAiStream.onLine(&stream, "data: [DONE]")));
+    try std.testing.expect(stream.metadata_error == null);
+    try std.testing.expectEqualStrings("first second", stream.accumulated.items);
+}
+
+test "OpenAI stream rejects malformed JSON between tool argument fragments" {
+    const Ignore = struct {
+        fn onChunk(_: *anyopaque, _: root.StreamChunk) void {}
+    };
+    var marker: u8 = 0;
+    var stream = OpenAiStream{ .allocator = std.testing.allocator, .callback = Ignore.onChunk, .ctx = &marker };
+    defer stream.deinit();
+    try std.testing.expect(try OpenAiStream.onLine(&stream, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"memory_store\",\"arguments\":\"{\\\"content\\\":\\\"first\"}}]}}]}"));
+    try std.testing.expect(try OpenAiStream.onLine(&stream, "data: {not-json}"));
+    try std.testing.expect(stream.metadata_error.? == error.InvalidSseJson);
+}
 
 /// Stream a provider reply through in-process libcurl and parse each frame once.
 pub fn curlStream(
@@ -775,6 +805,7 @@ test "appendDeltaContent closes reasoning before final" {
     const Collector = struct {
         buf: std.ArrayListUnmanaged(u8) = .empty,
         saw_final: bool = false,
+        saw_reasoning: bool = false,
 
         fn callback(ctx: *anyopaque, chunk: root.StreamChunk) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -782,6 +813,7 @@ test "appendDeltaContent closes reasoning before final" {
                 self.saw_final = true;
                 return;
             }
+            if (chunk.kind == .reasoning) self.saw_reasoning = true;
             self.buf.appendSlice(std.testing.allocator, chunk.delta) catch unreachable;
         }
     };
@@ -801,6 +833,7 @@ test "appendDeltaContent closes reasoning before final" {
     Collector.callback(@ptrCast(&collector), root.StreamChunk.finalChunk());
 
     try std.testing.expect(collector.saw_final);
+    try std.testing.expect(collector.saw_reasoning);
     try std.testing.expect(!in_reasoning);
     try std.testing.expectEqualStrings("<think>private</think>", accumulated.items);
     try std.testing.expectEqualStrings("<think>private</think>", collector.buf.items);
