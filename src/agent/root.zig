@@ -59,11 +59,116 @@ const SafeStreamGate = struct {
     target: providers.StreamCallback,
     ctx: *anyopaque,
     native_tools_enabled: bool,
+    blocked: bool = false,
+    answer_started: bool = false,
+    pending: [16]u8 = undefined,
+    pending_len: usize = 0,
+    pending_kind: providers.StreamChunkKind = .untrusted,
+
+    const markers = [_][]const u8{
+        "<tool_", "</tool_", "<|tool_", "</|tool_",
+        "[tool_", "[/tool_", "<think",  "</think",
+    };
+
+    fn markerPrefix(candidate: []const u8) bool {
+        for (markers) |marker| {
+            if (candidate.len <= marker.len and std.ascii.eqlIgnoreCase(candidate, marker[0..candidate.len])) return true;
+        }
+        return false;
+    }
+
+    fn markerComplete(candidate: []const u8) bool {
+        for (markers) |marker| {
+            if (candidate.len == marker.len and std.ascii.eqlIgnoreCase(candidate, marker)) return true;
+        }
+        return false;
+    }
+
+    fn hasUnsafeTextProtocol(text: []const u8) bool {
+        if (dispatcher.isNativeJsonFormat(text)) return true;
+        for (text, 0..) |byte, at| {
+            if (byte != '<' and byte != '[') continue;
+            for (markers) |marker| {
+                if (text.len - at >= marker.len and std.ascii.eqlIgnoreCase(text[at..][0..marker.len], marker)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn emit(self: *SafeStreamGate, source: providers.StreamChunk, text: []const u8, kind: providers.StreamChunkKind) void {
+        if (text.len == 0) return;
+        var part = source;
+        part.delta = text;
+        part.kind = kind;
+        self.target(self.ctx, part);
+    }
+
+    fn releaseNonMarker(self: *SafeStreamGate, source: providers.StreamChunk) void {
+        const pending = self.pending[0..self.pending_len];
+        if (markerComplete(pending)) {
+            self.blocked = true;
+            return;
+        }
+        if (markerPrefix(pending)) return;
+        var keep: usize = self.pending_len;
+        while (keep > 0) {
+            keep -= 1;
+            if (markerPrefix(pending[self.pending_len - keep ..])) break;
+        }
+        const released = self.pending_len - keep;
+        self.emit(source, pending[0..released], self.pending_kind);
+        std.mem.copyForwards(u8, self.pending[0..keep], pending[released..]);
+        self.pending_len = keep;
+        if (keep > 0 and markerComplete(self.pending[0..keep])) self.blocked = true;
+    }
 
     fn forward(ctx: *anyopaque, chunk: providers.StreamChunk) void {
         const self: *SafeStreamGate = @ptrCast(@alignCast(ctx));
-        if (self.native_tools_enabled and chunk.kind != .untrusted and !chunk.is_final)
-            self.target(self.ctx, chunk);
+        if (!self.native_tools_enabled or self.blocked or chunk.kind == .untrusted or chunk.is_final) return;
+        var at: usize = 0;
+        while (at < chunk.delta.len and !self.blocked) {
+            if (chunk.kind == .answer and !self.answer_started) {
+                const byte = chunk.delta[at];
+                if (!std.ascii.isWhitespace(byte)) {
+                    self.answer_started = true;
+                    if (byte == '{') {
+                        // A text-form native JSON tool call cannot be classified
+                        // until the full provider pass is available.
+                        self.blocked = true;
+                        return;
+                    }
+                }
+            }
+            if (self.pending_len == 0) {
+                const start = at;
+                while (at < chunk.delta.len and chunk.delta[at] != '<' and chunk.delta[at] != '[') : (at += 1) {
+                    const byte = chunk.delta[at];
+                    if (chunk.kind == .answer and !self.answer_started and !std.ascii.isWhitespace(byte)) {
+                        self.answer_started = true;
+                        if (byte == '{') {
+                            self.emit(chunk, chunk.delta[start..at], chunk.kind);
+                            self.blocked = true;
+                            return;
+                        }
+                    }
+                }
+                self.emit(chunk, chunk.delta[start..at], chunk.kind);
+                if (at == chunk.delta.len) break;
+                self.pending[0] = chunk.delta[at];
+                self.pending_len = 1;
+                self.pending_kind = chunk.kind;
+                at += 1;
+                continue;
+            }
+            if (self.pending_kind != chunk.kind) {
+                self.blocked = true;
+                return;
+            }
+            self.pending[self.pending_len] = chunk.delta[at];
+            self.pending_len += 1;
+            at += 1;
+            self.releaseNonMarker(chunk);
+        }
     }
 };
 
@@ -91,6 +196,61 @@ test "embedded stream gate forwards typed native text and withholds prompt-tool 
     var prompt_tools = SafeStreamGate{ .target = Sink.onChunk, .ctx = &sink, .native_tools_enabled = false };
     SafeStreamGate.forward(&prompt_tools, providers.StreamChunk.answerDelta("hidden"));
     try std.testing.expectEqual(@as(usize, 6), sink.answer);
+}
+
+test "embedded stream gate preserves code markup and withholds split tool syntax" {
+    const Sink = struct {
+        bytes: [256]u8 = undefined,
+        len: usize = 0,
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.debug.assert(self.len + chunk.delta.len <= self.bytes.len);
+            @memcpy(self.bytes[self.len..][0..chunk.delta.len], chunk.delta);
+            self.len += chunk.delta.len;
+        }
+        fn text(self: *const @This()) []const u8 {
+            return self.bytes[0..self.len];
+        }
+    };
+
+    var safe_sink = Sink{};
+    var safe = SafeStreamGate{ .target = Sink.onChunk, .ctx = &safe_sink, .native_tools_enabled = true };
+    SafeStreamGate.forward(&safe, providers.StreamChunk.answerDelta("Use <di"));
+    SafeStreamGate.forward(&safe, providers.StreamChunk.answerDelta("v> and Vec<String>"));
+    try std.testing.expectEqualStrings("Use <div> and Vec<String>", safe_sink.text());
+
+    var tool_sink = Sink{};
+    var tool = SafeStreamGate{ .target = Sink.onChunk, .ctx = &tool_sink, .native_tools_enabled = true };
+    SafeStreamGate.forward(&tool, providers.StreamChunk.answerDelta("safe <to"));
+    SafeStreamGate.forward(&tool, providers.StreamChunk.answerDelta("ol_call>{\"arguments\":\"secret\"}"));
+    SafeStreamGate.forward(&tool, providers.StreamChunk.answerDelta(" later"));
+    try std.testing.expectEqualStrings("safe ", tool_sink.text());
+    try std.testing.expect(tool.blocked);
+
+    var bracket_sink = Sink{};
+    var bracket = SafeStreamGate{ .target = Sink.onChunk, .ctx = &bracket_sink, .native_tools_enabled = true };
+    SafeStreamGate.forward(&bracket, providers.StreamChunk.reasoningDelta("think [TO"));
+    SafeStreamGate.forward(&bracket, providers.StreamChunk.reasoningDelta("OL_CALL]secret"));
+    try std.testing.expectEqualStrings("think ", bracket_sink.text());
+    try std.testing.expect(bracket.blocked);
+
+    var json_sink = Sink{};
+    var json = SafeStreamGate{ .target = Sink.onChunk, .ctx = &json_sink, .native_tools_enabled = true };
+    SafeStreamGate.forward(&json, providers.StreamChunk.answerDelta("  "));
+    SafeStreamGate.forward(&json, providers.StreamChunk.answerDelta("{\"tool_calls\":[{\"arguments\":\"secret\"}]}"));
+    try std.testing.expectEqualStrings("  ", json_sink.text());
+    try std.testing.expect(json.blocked);
+
+    var mixed_sink = Sink{};
+    var mixed = SafeStreamGate{ .target = Sink.onChunk, .ctx = &mixed_sink, .native_tools_enabled = true };
+    SafeStreamGate.forward(&mixed, providers.StreamChunk.answerDelta("safe <to"));
+    SafeStreamGate.forward(&mixed, providers.StreamChunk.reasoningDelta("ol_call>secret"));
+    try std.testing.expectEqualStrings("safe ", mixed_sink.text());
+    try std.testing.expect(mixed.blocked);
+
+    try std.testing.expect(SafeStreamGate.hasUnsafeTextProtocol("<tool_result>secret"));
+    try std.testing.expect(SafeStreamGate.hasUnsafeTextProtocol(" {\"tool_calls\":[]}"));
+    try std.testing.expect(!SafeStreamGate.hasUnsafeTextProtocol("Use <div> and Vec<String>"));
 }
 
 /// Maximum non-system messages before trimming.
@@ -2598,12 +2758,13 @@ pub const Agent = struct {
                 if (free_assistant_history and assistant_history_content.len > 0) self.allocator.free(assistant_history_content);
             }
 
+            const safe_native_pass = self.safe_stream_only and native_tools_enabled;
             if (use_native) {
                 // Provider returned structured tool_calls — convert them
                 parsed_calls = try dispatcher.parseStructuredToolCalls(self.allocator, response.tool_calls);
                 free_parsed_calls = true;
 
-                if (parsed_calls.len == 0) {
+                if (parsed_calls.len == 0 and !safe_native_pass) {
                     // Structured calls were empty (e.g. all had empty names) — try XML fallback
                     self.allocator.free(parsed_calls);
                     free_parsed_calls = false;
@@ -2622,6 +2783,11 @@ pub const Agent = struct {
                     parsed_calls,
                 );
                 free_assistant_history = true;
+            } else if (safe_native_pass) {
+                // A native-tools provider must return structured tool calls.
+                // Textual fallback could reinterpret bytes already shown live.
+                assistant_history_content = try dispatcher.stripToolResultMarkup(self.allocator, response_text);
+                free_assistant_history = true;
             } else {
                 // No native tool calls — parse response text for XML tool calls
                 const xml_parsed = try dispatcher.parseToolCalls(self.allocator, response_text);
@@ -2638,7 +2804,10 @@ pub const Agent = struct {
             // When tool calls are present, only show parsed plain text (if any).
             // Never fall back to raw response_text here, otherwise markup like
             // <tool_call>...</tool_call> can leak to users.
-            const display_text = selectDisplayText(response_text, parsed_text, parsed_calls.len);
+            const display_text = if (safe_native_pass and SafeStreamGate.hasUnsafeTextProtocol(response_text))
+                ""
+            else
+                selectDisplayText(response_text, parsed_text, parsed_calls.len);
 
             if (parsed_calls.len == 0) {
                 const trimmed_display_text = std.mem.trim(u8, display_text, " \t\r\n");
@@ -11190,6 +11359,91 @@ test "Agent executes a native tool call returned by a streaming provider" {
     try std.testing.expectEqualStrings("done", answer);
     try std.testing.expectEqual(@as(usize, 1), probe_count);
     try std.testing.expectEqual(@as(usize, 2), provider_state.count);
+}
+
+test "fleet native stream does not execute or publish textual tool fallback" {
+    const ProviderState = struct {
+        calls: usize = 0,
+        saw_retry_instruction: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ShouldUseStreamChat;
+        }
+        fn supports(_: *anyopaque) bool {
+            return true;
+        }
+        fn streamChat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, model: []const u8, _: f64, callback: providers.StreamCallback, ctx: *anyopaque) anyerror!providers.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) {
+                callback(ctx, providers.StreamChunk.answerDelta("safe <to"));
+                callback(ctx, providers.StreamChunk.answerDelta("ol_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"secret\"}}</tool_call>"));
+                return .{
+                    .content = try allocator.dupe(u8, "safe <tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"secret\"}}</tool_call>"),
+                    .model = try allocator.dupe(u8, model),
+                };
+            }
+            for (request.messages) |message| {
+                if (message.role == .user and std.mem.indexOf(u8, message.content, "Your previous reply was empty") != null) self.saw_retry_instruction = true;
+            }
+            callback(ctx, providers.StreamChunk.answerDelta("recovered"));
+            return .{ .content = try allocator.dupe(u8, "recovered"), .model = try allocator.dupe(u8, model) };
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "textual-tool-fallback-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+    const Sink = struct {
+        bytes: std.ArrayListUnmanaged(u8) = .empty,
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.bytes.appendSlice(std.testing.allocator, chunk.delta) catch unreachable;
+        }
+    };
+    const allocator = std.testing.allocator;
+    var state = ProviderState{};
+    const vtable = Provider.VTable{
+        .chatWithSystem = ProviderState.chatWithSystem,
+        .chat = ProviderState.chat,
+        .supportsNativeTools = ProviderState.supports,
+        .supports_streaming = ProviderState.supports,
+        .supportsStreamingTools = ProviderState.supports,
+        .stream_chat = ProviderState.streamChat,
+        .getName = ProviderState.getName,
+        .deinit = ProviderState.deinitFn,
+    };
+    var noop = observability.NoopObserver{};
+    var sink = Sink{};
+    defer sink.bytes.deinit(allocator);
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&state), .vtable = &vtable },
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .safe_stream_only = true,
+        .stream_callback = Sink.onChunk,
+        .stream_ctx = @ptrCast(&sink),
+    };
+    defer agent.deinit();
+    const answer = try agent.turn("reply without a tool");
+    defer allocator.free(answer);
+    try std.testing.expectEqualStrings("recovered", answer);
+    try std.testing.expectEqualStrings("safe recovered", sink.bytes.items);
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+    try std.testing.expect(state.saw_retry_instruction);
 }
 
 test "buildProviderMessagesForTurn adds priority hint without mutating history" {
