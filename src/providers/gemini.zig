@@ -8,7 +8,7 @@ const error_classify = @import("error_classify.zig");
 const config_types = @import("../config_types.zig");
 const http_util = @import("../http_util.zig");
 const sse = @import("sse.zig");
-const line_reader = @import("sse_line_reader.zig");
+const native_sse = @import("native_sse.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
@@ -55,17 +55,18 @@ fn normalizeTokenUsage(usage: *root.TokenUsage) void {
 
 fn finalizeGeminiStreamResult(
     allocator: std.mem.Allocator,
-    accumulated: []const u8,
+    accumulated: *std.ArrayListUnmanaged(u8),
     stream_usage: root.TokenUsage,
 ) !root.StreamChatResult {
     var usage = stream_usage;
-    const content = if (accumulated.len > 0)
-        try allocator.dupe(u8, accumulated)
+    const output_len = accumulated.items.len;
+    const content = if (output_len > 0)
+        try accumulated.toOwnedSlice(allocator)
     else
         null;
 
     if (usage.prompt_tokens == 0 and usage.completion_tokens == 0 and usage.total_tokens == 0) {
-        usage.completion_tokens = @intCast((accumulated.len + 3) / 4);
+        usage.completion_tokens = @intCast((output_len + 3) / 4);
         usage.total_tokens = usage.completion_tokens;
     } else {
         normalizeTokenUsage(&usage);
@@ -667,8 +668,6 @@ pub const GeminiProvider = struct {
     pub const GeminiSseResult = union(enum) {
         /// Text delta content (owned, caller frees).
         delta: []const u8,
-        /// Stream is complete (connection closed).
-        done: void,
         /// Line should be skipped (empty, comment, or no content).
         skip: void,
     };
@@ -732,13 +731,40 @@ pub const GeminiProvider = struct {
         return try allocator.dupe(u8, text.string);
     }
 
-    /// Run curl in SSE streaming mode for Gemini and parse output line by line.
-    ///
-    /// Spawns `curl -s --no-buffer` with the strongest supported fail-fast
-    /// flag: `--fail-with-body` on curl >= 7.76.0, otherwise `-f`.
-    /// For each SSE delta, calls `callback(ctx, chunk)`.
-    /// Returns accumulated result after stream completes.
-    /// Stream ends when curl connection closes (no [DONE] sentinel).
+    const GeminiStream = struct {
+        allocator: std.mem.Allocator,
+        callback: root.StreamCallback,
+        ctx: *anyopaque,
+        accumulated: std.ArrayListUnmanaged(u8) = .empty,
+        usage: root.TokenUsage = .{},
+        first_line: bool = true,
+
+        fn deinit(self: *GeminiStream) void {
+            self.accumulated.deinit(self.allocator);
+        }
+
+        fn onLine(context: *anyopaque, line: []const u8) anyerror!bool {
+            const self: *GeminiStream = @ptrCast(@alignCast(context));
+            if (self.first_line) if (sse.initialJsonError(self.allocator, line)) |err| return err;
+            self.first_line = false;
+            const trimmed = std_compat.mem.trimRight(u8, line, "\r");
+            if (!std.mem.startsWith(u8, trimmed, "data: ")) return true;
+            const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, trimmed[6..], .{}) catch return true;
+            defer parsed.deinit();
+            if (parsed.value != .object) return true;
+            if (parsed.value.object.get("usageMetadata")) |metadata| {
+                if (parseUsageMetadataValue(metadata)) |usage| self.usage = usage;
+            }
+            if (try extractGeminiDeltaValue(self.allocator, parsed.value)) |delta| {
+                defer self.allocator.free(delta);
+                try sse.appendStreamOutput(self.allocator, &self.accumulated, delta);
+                self.callback(self.ctx, root.StreamChunk.textDelta(delta));
+            }
+            return true;
+        }
+    };
+
+    /// Stream a Gemini reply through in-process libcurl until the connection closes.
     pub fn curlStreamGemini(
         allocator: std.mem.Allocator,
         url: []const u8,
@@ -748,120 +774,14 @@ pub const GeminiProvider = struct {
         callback: root.StreamCallback,
         ctx: *anyopaque,
     ) !root.StreamChatResult {
-        // Build argv on stack (max 36 args)
-        var argv_buf: [36][]const u8 = undefined;
-        var argc: usize = 0;
-
-        var timeout_buf: [32]u8 = undefined;
-        sse.appendCurlStreamBaseArgs(allocator, argv_buf[0..], &argc, &timeout_buf, timeout_secs);
-
-        // Add proxy from environment if set
-        const proxy = http_util.getProxyFromEnv(allocator) catch null;
-        defer if (proxy) |p| allocator.free(p);
-
-        if (proxy) |p| {
-            argv_buf[argc] = "--proxy";
-            argc += 1;
-            argv_buf[argc] = p;
-            argc += 1;
-        }
-
-        const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
-        defer if (resolve_entry) |entry| allocator.free(entry);
-        http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
-
-        var header_buf: [16][]const u8 = undefined;
-        var header_count: usize = 0;
-        header_buf[header_count] = "Content-Type: application/json";
-        header_count += 1;
-        for (headers) |hdr| {
-            if (header_count >= header_buf.len) return error.TooManyHeaders;
-            header_buf[header_count] = hdr;
-            header_count += 1;
-        }
-
-        var prepared_headers = try http_util.prepareCurlHeaderArg(allocator, header_buf[0..header_count]);
-        defer prepared_headers.deinit(allocator);
-        if (prepared_headers.arg) |headers_arg| {
-            argv_buf[argc] = "-H";
-            argc += 1;
-            argv_buf[argc] = headers_arg;
-            argc += 1;
-        }
-
-        argv_buf[argc] = "--data-binary";
-        argc += 1;
-        argv_buf[argc] = "@-";
-        argc += 1;
-        argv_buf[argc] = url;
-        argc += 1;
-
-        var child = sse.spawnCurl(allocator, argv_buf[0..argc], body) catch |err| {
-            if (err == error.CurlWriteError) return error.GeminiApiError;
-            return err;
-        };
-        var child_reaped = false;
-        defer if (!child_reaped) sse.stopCurl(&child);
-
-        // Read stdout line by line, parse SSE events
-        var accumulated: std.ArrayListUnmanaged(u8) = .empty;
-        defer accumulated.deinit(allocator);
-
-        var reader = line_reader.Reader.init(allocator, child.stdout.?);
-        defer reader.deinit();
-
-        var stream_usage = root.TokenUsage{};
-
-        while (try reader.next()) |line| {
-            const trimmed = std_compat.mem.trimRight(u8, line, "\r");
-            if (!std.mem.startsWith(u8, trimmed, "data: ")) continue;
-            const parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed[6..], .{}) catch continue;
-            defer parsed.deinit();
-            if (parsed.value != .object) continue;
-            if (parsed.value.object.get("usageMetadata")) |metadata| {
-                if (parseUsageMetadataValue(metadata)) |usage| {
-                    stream_usage = usage;
-                }
-            }
-            if (try extractGeminiDeltaValue(allocator, parsed.value)) |delta| {
-                defer allocator.free(delta);
-                try sse.appendStreamOutput(allocator, &accumulated, delta);
-                callback(ctx, root.StreamChunk.textDelta(delta));
-            }
-        }
-
-        const term = child.wait() catch |err| {
-            log.err("curlStreamGemini child.wait failed: {}", .{err});
-            if (root.shouldRecoverPartialStream(accumulated.items.len, false)) {
-                log.warn("curlStreamGemini proceeding despite wait failure after partial stream output", .{});
-                callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
-            }
-            return error.CurlWaitError;
-        };
-        child_reaped = true;
-        switch (term) {
-            .exited => |code| if (code != 0) {
-                if (root.shouldRecoverPartialStream(accumulated.items.len, false)) {
-                    log.warn("curlStreamGemini exit code {d} after partial stream output; returning accumulated output", .{code});
-                    callback(ctx, root.StreamChunk.finalChunk());
-                    return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
-                }
-                return error.CurlFailed;
-            },
-            else => {
-                if (root.shouldRecoverPartialStream(accumulated.items.len, false)) {
-                    log.warn("curlStreamGemini abnormal termination after partial stream output; returning accumulated output", .{});
-                    callback(ctx, root.StreamChunk.finalChunk());
-                    return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
-                }
-                return error.CurlFailed;
-            },
-        }
-
-        // Signal completion only after successful process exit.
+        var stream = GeminiStream{ .allocator = allocator, .callback = callback, .ctx = ctx };
+        defer stream.deinit();
+        const transfer = try native_sse.postJson(allocator, url, body, headers, timeout_secs, &stream, GeminiStream.onLine);
+        if (transfer.status < 200 or transfer.status >= 300) return error.GeminiApiError;
+        if (!transfer.ok and !root.shouldRecoverPartialStream(stream.accumulated.items.len, false))
+            return error.CurlFailed;
         callback(ctx, root.StreamChunk.finalChunk());
-        return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
+        return finalizeGeminiStreamResult(allocator, &stream.accumulated, stream.usage);
     }
 
     /// Create a Provider interface from this GeminiProvider.

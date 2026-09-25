@@ -222,8 +222,8 @@ pub const CurlHeaderArg = struct {
     }
 };
 
-fn validateCurlHeaderLine(header: []const u8) !void {
-    if (std.mem.indexOfAny(u8, header, "\r\n") != null) return error.InvalidHeader;
+pub fn validateCurlHeaderLine(header: []const u8) !void {
+    if (std.mem.indexOfAny(u8, header, "\r\n\x00") != null) return error.InvalidHeader;
 }
 
 pub fn prepareCurlHeaderArg(allocator: Allocator, headers: []const []const u8) !CurlHeaderArg {

@@ -375,9 +375,27 @@ fn addEmbeddedWasm3(module: *std.Build.Module, b: *std.Build, target: std.Build.
     module.linkLibrary(wasm3_dep.artifact("wasm3"));
 }
 
+fn linkStreamCurl(module: *std.Build.Module, target: std.Build.ResolvedTarget, is_static: bool) void {
+    if (is_static and target.result.os.tag == .linux and target.result.abi == .musl) {
+        // The pinned Alpine builder installs a small, non-LTO curl archive.
+        // Alpine's general curl-static pulls GCC-LTO Brotli/PSL archives that
+        // Zig's linker cannot consume, while a sandboxed runner needs no .so.
+        module.addIncludePath(.{ .cwd_relative = "/opt/curl-min/include" });
+        for ([_][]const u8{
+            "/opt/curl-min/lib/libcurl.a",
+            "/usr/lib/libssl.a",
+            "/usr/lib/libcrypto.a",
+            "/usr/lib/libz.a",
+        }) |archive| module.addObjectFile(.{ .cwd_relative = archive });
+    } else {
+        module.linkSystemLibrary("curl", .{});
+    }
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const stream_transport_tests = b.option(bool, "stream-transport-tests", "Run local socket transport integration and latency tests") orelse false;
     const is_wasi = target.result.os.tag == .wasi;
     const is_static = b.option(bool, "static", "Static build") orelse false;
     const enable_embedded_wasm3 = b.option(bool, "embedded_wasm3", "Embed wasm3 runtime into nullclaw binary (default: true; use -Dembedded_wasm3=false to disable)") orelse true;
@@ -469,6 +487,7 @@ pub fn build(b: *std.Build) void {
 
     var build_options = b.addOptions();
     build_options.addOption([]const u8, "version", app_version);
+    build_options.addOption(bool, "stream_transport_tests", stream_transport_tests);
     build_options.addOption(bool, "enable_memory_none", enable_memory_none);
     build_options.addOption(bool, "enable_memory_markdown", enable_memory_markdown);
     build_options.addOption(bool, "enable_memory_memory", enable_memory_memory);
@@ -521,6 +540,7 @@ pub fn build(b: *std.Build) void {
         });
         module.addImport("build_options", build_options_module);
         module.addImport("compat", compat_module);
+        linkStreamCurl(module, target, is_static);
         if (sqlite3) |lib| {
             module.linkLibrary(lib);
         }
@@ -574,6 +594,7 @@ pub fn build(b: *std.Build) void {
 
     // Link SQLite on the compile step (not the module)
     if (!is_wasi) {
+        linkStreamCurl(exe.root_module, target, is_static);
         if (sqlite3) |lib| {
             exe.root_module.linkLibrary(lib);
         }
@@ -621,6 +642,7 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(compat_tests).step);
 
         const lib_tests = b.addTest(.{ .root_module = lib_mod.? });
+        linkStreamCurl(lib_tests.root_module, target, is_static);
         if (sqlite3) |lib| {
             lib_tests.root_module.linkLibrary(lib);
         }
