@@ -428,9 +428,8 @@ fn extractDeltaContentValue(allocator: std.mem.Allocator, value: std.json.Value)
 /// exist from a rejected credential — `error_classify` collapses both into the
 /// same bucket — which is exactly the difference an operator needs.
 ///
-/// Best-effort by construction: it runs while an error is already returning,
-/// so a scrub allocation failure falls back to the unscrubbed summary rather
-/// than replacing the caller's error.
+/// Best-effort by construction: a scrub allocation failure records only the
+/// mapped error name, never upstream text that may echo credentials.
 fn recordStreamApiErrorDetail(
     allocator: std.mem.Allocator,
     root_obj: std.json.ObjectMap,
@@ -440,7 +439,7 @@ fn recordStreamApiErrorDetail(
     const summary = error_classify.summarizeKnownApiError(root_obj, &summary_buf) orelse @errorName(mapped_err);
     const sanitized = root.sanitizeApiError(allocator, summary) catch null;
     defer if (sanitized) |s| allocator.free(s);
-    root.setLastApiErrorDetail("", sanitized orelse summary);
+    root.setLastApiErrorDetail("", sanitized orelse @errorName(mapped_err));
 }
 
 /// Record an error payload that is JSON but not a shape `error_classify`
@@ -649,9 +648,7 @@ pub fn curlStream(
     };
 
     const stream_complete = saw_done or tool_collector.finish_reason != .unknown;
-    if (!stream_complete and tool_collector.count > 0) return error.IncompleteStreamToolCall;
-    if (tool_collector.count > 0 and
-        (tool_collector.finish_reason == .length or tool_collector.finish_reason == .content_filter))
+    if (tool_collector.count > 0 and tool_collector.finish_reason != .tool_calls)
         return error.IncompleteStreamToolCall;
     // Signal stream completion only after curl exits and tool metadata passes validation.
     try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);

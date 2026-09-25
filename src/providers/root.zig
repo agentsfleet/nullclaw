@@ -419,6 +419,8 @@ pub const Provider = struct {
         supports_streaming: ?*const fn (ptr: *anyopaque) bool = null,
         /// Native tool calls can be decoded from this provider's streaming response.
         supportsStreamingTools: ?*const fn (ptr: *anyopaque) bool = null,
+        /// Resolve tool support for the model that will receive this turn.
+        supportsToolsForModel: ?*const fn (ptr: *anyopaque, model: []const u8, streaming: bool) bool = null,
         /// Optional: returns true if provider supports vision/image input. Default: false.
         supports_vision: ?*const fn (ptr: *anyopaque) bool = null,
         /// Optional: returns true if provider supports vision for a specific model.
@@ -483,6 +485,11 @@ pub const Provider = struct {
     pub fn supportsStreamingTools(self: Provider) bool {
         if (self.vtable.supportsStreamingTools) |f| return f(self.ptr);
         return false;
+    }
+
+    pub fn supportsToolsForModel(self: Provider, model: []const u8, streaming: bool) bool {
+        if (self.vtable.supportsToolsForModel) |f| return f(self.ptr, model, streaming);
+        return self.supportsNativeTools() and (!streaming or self.supportsStreamingTools());
     }
 
     /// Returns true if provider supports vision/image input.

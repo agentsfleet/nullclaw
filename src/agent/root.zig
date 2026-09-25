@@ -2060,8 +2060,7 @@ pub const Agent = struct {
             defer prompt_tools_arena.deinit();
             const prompt_tools = try self.filterToolsForPromptText(prompt_tools_arena.allocator());
             const prompt_is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
-            const prompt_native_tools_enabled = self.provider.supportsNativeTools() and
-                (!prompt_is_streaming or self.provider.supportsStreamingTools());
+            const prompt_native_tools_enabled = self.provider.supportsToolsForModel(turn_model_name, prompt_is_streaming);
 
             const capabilities_section = capabilities_mod.buildPromptSection(
                 self.allocator,
@@ -2239,8 +2238,7 @@ pub const Agent = struct {
 
             const timer_start = std_compat.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
-            const native_tools_enabled = self.provider.supportsNativeTools() and
-                (!is_streaming or self.provider.supportsStreamingTools());
+            const native_tools_enabled = self.provider.supportsToolsForModel(turn_model_name, is_streaming);
             const include_reasoning = self.reasoning_mode != .off;
 
             // Filter tool specs for this turn (arena-owned; may be self.tool_specs directly if no groups).
