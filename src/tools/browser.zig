@@ -5,14 +5,15 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const net_security = @import("../root.zig").net_security;
+const safe_http = @import("../safe_http.zig");
 
 /// Maximum response body size for the "read" action (8 KB).
 const MAX_READ_BYTES: usize = 8192;
-/// Maximum raw fetch size passed to curl (64 KB, then truncated to MAX_READ_BYTES).
+/// Maximum raw fetch size (64 KB, then truncated to MAX_READ_BYTES).
 const MAX_FETCH_BYTES: usize = 65536;
 
 /// Browser tool — opens URLs in the system browser and fetches page content.
-/// Supports "open" (launch URL), "read" (fetch body via curl), and returns
+/// Supports "open" (launch URL), "read" (fetch body via native HTTP), and returns
 /// informative errors for CDP-only actions (click, type, scroll, screenshot).
 pub const BrowserTool = struct {
     pub const tool_name = "browser";
@@ -108,7 +109,7 @@ pub const BrowserTool = struct {
         return ToolResult{ .success = true, .output = msg };
     }
 
-    /// "read" — fetch URL content via curl and return body text (truncated to 8 KB).
+    /// "read" — fetch URL content and return body text (truncated to 8 KB).
     fn executeRead(allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const url = root.getString(args, "url") orelse
             return ToolResult.fail("Missing 'url' parameter for read action");
@@ -119,115 +120,35 @@ pub const BrowserTool = struct {
         net_security.validateOutboundUrl(url) catch {
             return ToolResult.fail("Only https:// URLs are supported for security");
         };
-        const uri = std.Uri.parse(url) catch
-            return ToolResult.fail("Invalid URL format");
-
-        const host = net_security.extractHost(url) orelse
-            return ToolResult.fail("Invalid URL: cannot extract host");
-        const resolved_port: u16 = uri.port orelse 443;
-        const connect_host = net_security.resolveConnectHost(allocator, host, resolved_port) catch |err| switch (err) {
+        if (builtin.is_test and net_security.isLocalHost(net_security.extractHost(url) orelse ""))
+            return ToolResult.fail("Blocked local/private host");
+        var response = safe_http.get(allocator, url, .{
+            .timeout_secs = 10,
+            .max_body_bytes = MAX_FETCH_BYTES,
+        }) catch |err| switch (err) {
             error.LocalAddressBlocked => return ToolResult.fail("Blocked local/private host"),
-            else => return ToolResult.fail("Unable to verify host safety"),
-        };
-        defer allocator.free(connect_host);
-
-        // Use curl to fetch the page. Flags:
-        //   -sS  silent but show errors
-        //   -L   follow redirects
-        //   -m 10  timeout 10 seconds
-        //   --max-filesize 65536  abort if body exceeds 64 KB
-        const max_size_str = std.fmt.comptimePrint("{d}", .{MAX_FETCH_BYTES});
-        var resolve_entry: ?[]u8 = null;
-        defer if (resolve_entry) |entry| allocator.free(entry);
-
-        var argv_buf: [16][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-sS";
-        argc += 1;
-        argv_buf[argc] = "-L";
-        argc += 1;
-        argv_buf[argc] = "-m";
-        argc += 1;
-        argv_buf[argc] = "10";
-        argc += 1;
-        argv_buf[argc] = "--max-filesize";
-        argc += 1;
-        argv_buf[argc] = max_size_str;
-        argc += 1;
-        argv_buf[argc] = "--proto";
-        argc += 1;
-        argv_buf[argc] = "=https";
-        argc += 1;
-        argv_buf[argc] = "--proto-redir";
-        argc += 1;
-        argv_buf[argc] = "=https";
-        argc += 1;
-
-        if (shouldUseCurlResolve(host)) {
-            resolve_entry = try buildCurlResolveEntry(allocator, host, resolved_port, connect_host);
-            argv_buf[argc] = "--resolve";
-            argc += 1;
-            argv_buf[argc] = resolve_entry.?;
-            argc += 1;
-        }
-
-        argv_buf[argc] = "--";
-        argc += 1;
-        argv_buf[argc] = url;
-        argc += 1;
-
-        const proc = @import("process_util.zig");
-        const result = proc.run(allocator, argv_buf[0..argc], .{ .max_output_bytes = MAX_FETCH_BYTES }) catch {
-            return ToolResult.fail("Failed to spawn curl — is curl installed?");
-        };
-        defer allocator.free(result.stderr);
-        defer allocator.free(result.stdout);
-
-        if (!result.success) {
-            if (result.exit_code) |code| {
-                const detail = if (result.stderr.len > 0) result.stderr else "curl request failed";
-                const msg = try std.fmt.allocPrint(allocator, "curl exited with code {d}: {s}", .{ code, detail });
+            error.HostResolutionFailed => return ToolResult.fail("Unable to verify host safety"),
+            else => {
+                const msg = try std.fmt.allocPrint(allocator, "Page request failed: {}", .{err});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
-            }
-            return ToolResult{ .success = false, .output = "", .error_msg = "curl terminated by signal" };
-        }
+            },
+        };
+        defer response.deinit(allocator);
 
-        if (result.stdout.len == 0) {
+        if (response.body.len == 0) {
             const msg = try allocator.dupe(u8, "Page returned empty response");
             return ToolResult{ .success = true, .output = msg };
         }
 
         // Truncate to MAX_READ_BYTES
-        const truncated = result.stdout.len > MAX_READ_BYTES;
-        const body_len = if (truncated) MAX_READ_BYTES else result.stdout.len;
+        const truncated = response.body.len > MAX_READ_BYTES;
+        const body_len = if (truncated) MAX_READ_BYTES else response.body.len;
         const suffix: []const u8 = if (truncated) "\n\n[Content truncated to 8 KB]" else "";
 
-        const output = try std.fmt.allocPrint(allocator, "{s}{s}", .{ result.stdout[0..body_len], suffix });
+        const output = try std.fmt.allocPrint(allocator, "{s}{s}", .{ response.body[0..body_len], suffix });
         return ToolResult{ .success = true, .output = output };
     }
 };
-
-fn shouldUseCurlResolve(host: []const u8) bool {
-    return std.mem.indexOfScalar(u8, net_security.stripHostBrackets(host), ':') == null;
-}
-
-fn buildCurlResolveEntry(
-    allocator: std.mem.Allocator,
-    host: []const u8,
-    port: u16,
-    connect_host: []const u8,
-) ![]u8 {
-    const host_for_resolve = net_security.stripHostBrackets(host);
-    const connect_target = if (std.mem.indexOfScalar(u8, connect_host, ':') != null)
-        try std.fmt.allocPrint(allocator, "[{s}]", .{connect_host})
-    else
-        try allocator.dupe(u8, connect_host);
-    defer allocator.free(connect_target);
-
-    return std.fmt.allocPrint(allocator, "{s}:{d}:{s}", .{ host_for_resolve, port, connect_target });
-}
 
 // ── Tests ───────────────────────────────────────────────────────────
 

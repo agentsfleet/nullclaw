@@ -1219,12 +1219,20 @@ test "100 local SSE calls return complete replies with ten concurrent workers" {
     var samples = [_]LocalStreamSample{.{}} ** LOCAL_STREAM_CALLS;
     var workers: [LOCAL_STREAM_WORKERS]LocalStreamWorker = undefined;
     var threads: [LOCAL_STREAM_WORKERS]std.Thread = undefined;
+    const concurrent_started = std.Io.Clock.awake.now(std_compat.io()).nanoseconds;
     for (&workers, 0..) |*worker, i| {
         const begin = i * (LOCAL_STREAM_CALLS / LOCAL_STREAM_WORKERS);
         worker.* = .{ .url = url, .samples = samples[begin .. begin + LOCAL_STREAM_CALLS / LOCAL_STREAM_WORKERS] };
         threads[i] = try std.Thread.spawn(.{}, LocalStreamWorker.run, .{worker});
     }
     for (&threads) |*thread| thread.join();
+    const concurrent_ms: u64 = @intCast(@divTrunc(std.Io.Clock.awake.now(std_compat.io()).nanoseconds - concurrent_started, std.time.ns_per_ms));
+
+    var serial_samples = [_]LocalStreamSample{.{}} ** LOCAL_STREAM_CALLS;
+    var serial_worker = LocalStreamWorker{ .url = url, .samples = &serial_samples };
+    const serial_started = std.Io.Clock.awake.now(std_compat.io()).nanoseconds;
+    serial_worker.run();
+    const serial_ms: u64 = @intCast(@divTrunc(std.Io.Clock.awake.now(std_compat.io()).nanoseconds - serial_started, std.time.ns_per_ms));
     serving.stopAndJoinMany(&server_threads);
     server_joined = true;
 
@@ -1235,12 +1243,13 @@ test "100 local SSE calls return complete replies with ten concurrent workers" {
         first[i] = sample.first_ms;
         final[i] = sample.final_ms;
     }
-    try std.testing.expectEqual(@as(usize, LOCAL_STREAM_CALLS), serving.accepted.load(.acquire));
+    for (serial_samples) |sample| try std.testing.expect(sample.success);
+    try std.testing.expectEqual(@as(usize, 2 * LOCAL_STREAM_CALLS), serving.accepted.load(.acquire));
     try std.testing.expect(serving.peak.load(.acquire) >= 2);
     std.mem.sortUnstable(u64, &first, {}, std.sort.asc(u64));
     std.mem.sortUnstable(u64, &final, {}, std.sort.asc(u64));
-    std.debug.print("local SSE 100/100: first p50={d}ms p95={d}ms p99={d}ms; final p50={d}ms p95={d}ms p99={d}ms\n", .{
-        first[49], first[94], first[98], final[49], final[94], final[98],
+    std.debug.print("local SSE 100/100: concurrent={d}ms serial={d}ms; first p50={d}ms p95={d}ms p99={d}ms; final p50={d}ms p95={d}ms p99={d}ms\n", .{
+        concurrent_ms, serial_ms, first[49], first[94], first[98], final[49], final[94], final[98],
     });
 }
 
@@ -1318,6 +1327,7 @@ test "local HTTP errors and redirects cannot become successful partial replies" 
 const HeldOpenStreamServer = struct {
     server: *std_compat.net.Server,
     caller_returned: *std.atomic.Value(bool),
+    sent: ?*std.atomic.Value(bool) = null,
     saw_caller_return: bool = false,
 
     fn run(self: *HeldOpenStreamServer) void {
@@ -1326,6 +1336,7 @@ const HeldOpenStreamServer = struct {
         readLocalStreamRequest(conn.stream) catch return;
         const response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n" ++ LOCAL_STREAM_RESPONSE_BODY;
         conn.stream.writeAll(response) catch return;
+        if (self.sent) |sent| sent.store(true, .release);
         for (0..200) |_| {
             if (self.caller_returned.load(.acquire)) {
                 self.saw_caller_return = true;
@@ -1359,4 +1370,63 @@ test "terminal SSE event completes before a provider closes its socket" {
     try std.testing.expect(held_open.saw_caller_return);
     try std.testing.expectEqual(@as(usize, 1), callback.final_calls);
     try std.testing.expectEqualStrings("ok", result.content.?);
+}
+
+test "idle native HTTP stream stops within one poll interval budget" {
+    if (!@import("build_options").stream_transport_tests) return error.SkipZigTest;
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const native_http = @import("../native_http.zig");
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    var release_server = std.atomic.Value(bool).init(false);
+    var sent = std.atomic.Value(bool).init(false);
+    var held_open = HeldOpenStreamServer{ .server = &server, .caller_returned = &release_server, .sent = &sent };
+    var server_thread = try std.Thread.spawn(.{}, HeldOpenStreamServer.run, .{&held_open});
+    defer {
+        release_server.store(true, .release);
+        server_thread.join();
+    }
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/stream", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+    var interrupted = std.atomic.Value(bool).init(false);
+    const CancelRequest = struct {
+        url: []const u8,
+        flag: *const std.atomic.Value(bool),
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var response = native_http.perform(std.heap.page_allocator, .{
+                .method = .post,
+                .url = self.url,
+                .body = "{}",
+                .timeout_secs = 4,
+                .interrupt_flag = self.flag,
+            }) catch |err| {
+                self.result = err;
+                return;
+            };
+            response.deinit(std.heap.page_allocator);
+        }
+    };
+    var request = CancelRequest{ .url = url, .flag = &interrupted };
+    var caller_thread = try std.Thread.spawn(.{}, CancelRequest.run, .{&request});
+    var caller_joined = false;
+    defer if (!caller_joined) {
+        interrupted.store(true, .release);
+        caller_thread.join();
+    };
+    for (0..100) |_| {
+        if (sent.load(.acquire)) break;
+        std_compat.thread.sleep(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(sent.load(.acquire));
+    const started = std.Io.Clock.awake.now(std_compat.io()).nanoseconds;
+    interrupted.store(true, .release);
+    caller_thread.join();
+    caller_joined = true;
+    const elapsed_ms = @divTrunc(std.Io.Clock.awake.now(std_compat.io()).nanoseconds - started, std.time.ns_per_ms);
+    try std.testing.expectEqual(error.CurlInterrupted, request.result.?);
+    try std.testing.expect(elapsed_ms < 500);
 }

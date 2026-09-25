@@ -1076,10 +1076,8 @@ test "Gemini API and OAuth credentials become distinct protected headers" {
     try std.testing.expectEqualStrings("x-goog-api-key: api-key-123", api_header);
     try std.testing.expectEqualStrings("Authorization: Bearer ya29.test-token", oauth_header);
 
-    var prepared = try http_util.prepareCurlHeaderArg(allocator, &.{api_header});
-    defer prepared.deinit(allocator);
-    try std.testing.expect(prepared.uses_temp_file);
-    try std.testing.expect(std.mem.indexOf(u8, prepared.arg.?, "api-key-123") == null);
+    try @import("../native_http.zig").validateHeaderLine(api_header);
+    try @import("../native_http.zig").validateHeaderLine(oauth_header);
 }
 
 test "model name formatting" {

@@ -6,6 +6,7 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
+const safe_http = @import("safe_http.zig");
 
 const log = std.log.scoped(.update);
 
@@ -195,26 +196,17 @@ pub const ReleaseInfo = struct {
 pub fn getLatestRelease(allocator: std.mem.Allocator) !ReleaseInfo {
     const url = "https://api.github.com/repos/nullclaw/nullclaw/releases/latest";
 
-    // Use curl subprocess approach (from http_util pattern)
-    const result = std_compat.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "curl", "-sf", "--max-time", "30", url },
-        .max_output_bytes = 10 * 1024 * 1024,
-    }) catch |err| {
-        log.err("curl failed: {}", .{err});
-        return error.CurlFailed;
-    };
-    defer {
-        allocator.free(result.stdout);
-        allocator.free(result.stderr);
-    }
-
-    if (result.stdout.len == 0) {
-        return error.EmptyResponse;
-    }
+    var response = try safe_http.get(allocator, url, .{
+        .timeout_secs = 30,
+        .max_body_bytes = 10 * 1024 * 1024,
+        .headers = &.{"User-Agent: nullclaw"},
+    });
+    defer response.deinit(allocator);
+    if (response.status < 200 or response.status >= 300) return error.ReleaseRequestFailed;
+    if (response.body.len == 0) return error.EmptyResponse;
 
     // Parse JSON
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{}) catch |err| {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, response.body, .{}) catch |err| {
         log.err("JSON parse failed: {}", .{err});
         return error.InvalidJson;
     };
@@ -349,65 +341,25 @@ fn downloadAndInstall(
     std.debug.print("Installed successfully.\n", .{});
 }
 
-/// Download a URL directly to a file using curl.
-/// Streams the data to avoid memory buffer limits.
-/// Returns the number of bytes downloaded.
-inline fn logDownloadToFileError(comptime fmt: []const u8, args: anytype) void {
-    // Regression #599: tests may convert CurlFailed into SkipZigTest when a local
-    // curl policy disables file:// support. Avoid tripping logged-errors first.
-    if (!builtin.is_test) log.err(fmt, args);
-}
-
+/// Stream a verified HTTPS response directly to a file.
 fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, file: *std_compat.fs.File) !usize {
-    const argv = &[_][]const u8{ "curl", "-sfL", "--max-time", "60", url };
-    var child = std_compat.process.Child.init(argv, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    child.spawn() catch |err| {
-        logDownloadToFileError("curl spawn failed: {}", .{err});
-        return error.CurlFailed;
+    const FileSink = struct {
+        fn onBytes(ctx: *anyopaque, bytes: []const u8) anyerror!bool {
+            const target: *std_compat.fs.File = @ptrCast(@alignCast(ctx));
+            try target.writeAll(bytes);
+            return true;
+        }
     };
-
-    const stdout = child.stdout.?;
-
-    const BUF_SIZE = 64 * 1024;
-    var buffer: [BUF_SIZE]u8 = undefined;
-    var total_bytes: usize = 0;
-
-    while (true) {
-        const bytes_read = stdout.read(&buffer) catch |err| {
-            logDownloadToFileError("curl read failed: {}", .{err});
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return error.CurlFailed;
-        };
-
-        if (bytes_read == 0) break;
-
-        file.writeAll(buffer[0..bytes_read]) catch |err| {
-            logDownloadToFileError("download write failed: {}", .{err});
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return err;
-        };
-        total_bytes += bytes_read;
-    }
-
-    const term = child.wait() catch |err| {
-        logDownloadToFileError("curl wait failed: {}", .{err});
-        return error.CurlFailed;
-    };
-
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            logDownloadToFileError("curl exited with code: {}", .{code});
-            return error.CurlFailed;
-        },
-        else => return error.CurlFailed,
-    }
-
-    return total_bytes;
+    var response = try safe_http.get(allocator, url, .{
+        .timeout_secs = 60,
+        .max_body_bytes = 256 * 1024 * 1024,
+        .sink = FileSink.onBytes,
+        .sink_ctx = file,
+    });
+    defer response.deinit(allocator);
+    if (response.status < 200 or response.status >= 300) return error.CurlFailed;
+    const size = try file.stat();
+    return @intCast(size.size);
 }
 
 fn atomicReplace(tmp_path: []const u8, exe_path: []const u8) !void {
@@ -486,47 +438,11 @@ test "platformFromParts maps supported and unsupported targets" {
     try std.testing.expect(platformFromParts(.freebsd, .x86_64) == null);
 }
 
-test "downloadToFile streams from local file URL" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-
+test "downloadToFile rejects non-HTTPS URLs before writing" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-
-    const src_name = "src.bin";
-    const dst_name = "dst.bin";
-    const payload = "hello-streaming-download";
-
-    var src_file = try @import("compat").fs.Dir.wrap(tmp_dir.dir).createFile(src_name, .{});
-    defer src_file.close();
-    try src_file.writeAll(payload);
-    try src_file.sync();
-
-    const src_abs = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, src_name);
-    defer allocator.free(src_abs);
-
-    const file_url = try std.fmt.allocPrint(allocator, "file://{s}", .{src_abs});
-    defer allocator.free(file_url);
-
-    var dst_file = try @import("compat").fs.Dir.wrap(tmp_dir.dir).createFile(dst_name, .{ .read = true });
+    var dst_file = try @import("compat").fs.Dir.wrap(tmp_dir.dir).createFile("dst.bin", .{ .read = true });
     defer dst_file.close();
-
-    const bytes_downloaded = downloadToFile(
-        allocator,
-        file_url,
-        &dst_file,
-    ) catch |err| {
-        // Regression #599: a local ~/.curlrc can disable file:// support even when
-        // curl is installed. That environment mismatch should skip this test cleanly.
-        if (err == error.CurlFailed) return error.SkipZigTest;
-        return err;
-    };
-
-    try std.testing.expectEqual(payload.len, bytes_downloaded);
-
-    try dst_file.seekTo(0);
-    const content = try dst_file.readToEndAlloc(allocator, payload.len + 1);
-    defer allocator.free(content);
-    try std.testing.expectEqualStrings(payload, content);
+    try std.testing.expectError(error.UnsupportedScheme, downloadToFile(std.testing.allocator, "file:///tmp/update.bin", &dst_file));
+    try std.testing.expectEqual(@as(u64, 0), (try dst_file.stat()).size);
 }

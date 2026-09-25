@@ -5,10 +5,10 @@
 //! Pattern follows store_qdrant.zig: std.http.Client + std.Io.Writer.Allocating.
 
 const std = @import("std");
-const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
 const http_util = @import("../../http_util.zig");
+const native_http = @import("../../native_http.zig");
 const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
@@ -136,124 +136,50 @@ pub const ApiMemory = struct {
         method: std.http.Method,
         payload: ?[]const u8,
     ) !HttpResponse {
-        // Keep curl for deterministic --max-time behavior, but keep headers out
-        // of argv and send request bodies over stdin.
-        const timeout_secs: u32 = @max(@as(u32, 1), (self.timeout_ms + 999) / 1000);
-        var timeout_buf: [16]u8 = undefined;
-        const timeout_secs_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch unreachable;
-
+        const native_method: native_http.Method = switch (method) {
+            .GET => .get,
+            .POST => .post,
+            .PUT => .put,
+            .PATCH => .patch,
+            .DELETE => .delete,
+            else => return error.ApiInvalidResponse,
+        };
         var auth_header: ?[]u8 = null;
-        defer if (auth_header) |h| alloc.free(h);
-
-        var headers_buf: [2][]const u8 = undefined;
-        var header_count: usize = 0;
-        headers_buf[header_count] = "Content-Type: application/json";
-        header_count += 1;
+        defer if (auth_header) |header| alloc.free(header);
+        var headers: [2][]const u8 = undefined;
+        headers[0] = "Content-Type: application/json";
+        var header_count: usize = 1;
         if (self.api_key) |key| {
             auth_header = try std.fmt.allocPrint(alloc, "Authorization: Bearer {s}", .{key});
-            headers_buf[header_count] = auth_header.?;
+            headers[header_count] = auth_header.?;
             header_count += 1;
         }
-
-        var prepared_headers = try http_util.prepareCurlHeaderArg(alloc, headers_buf[0..header_count]);
-        defer prepared_headers.deinit(alloc);
-
-        var argv_buf: [24][]const u8 = undefined;
-        var argc: usize = 0;
-
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "--silent";
-        argc += 1;
-        argv_buf[argc] = "--show-error";
-        argc += 1;
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = timeout_secs_str;
-        argc += 1;
-        argv_buf[argc] = "--request";
-        argc += 1;
-        argv_buf[argc] = @tagName(method);
-        argc += 1;
-
-        if (prepared_headers.arg) |headers_arg| {
-            argv_buf[argc] = "--header";
-            argc += 1;
-            argv_buf[argc] = headers_arg;
-            argc += 1;
+        const resolve_entry = http_util.buildSafeResolveEntryForRemoteUrl(alloc, url) catch return error.ApiConnectionError;
+        defer if (resolve_entry) |entry| alloc.free(entry);
+        const proxy = try http_util.getProxyFromEnv(alloc);
+        defer if (proxy) |value| alloc.free(value);
+        const timeout_secs: u64 = @max(1, (@as(u64, self.timeout_ms) + 999) / 1000);
+        var response = native_http.perform(alloc, .{
+            .method = native_method,
+            .url = url,
+            .body = payload,
+            .headers = headers[0..header_count],
+            .proxy = proxy,
+            .resolve_entry = resolve_entry,
+            .timeout_secs = timeout_secs,
+            .max_body_bytes = 16 * 1024 * 1024,
+            .interrupt_flag = http_util.currentThreadInterruptFlag(),
+        }) catch return error.ApiConnectionError;
+        if (response.transport_error) |err| {
+            response.deinit(alloc);
+            return if (err == error.CurlTimeout) error.ApiTimeout else error.ApiConnectionError;
         }
-
-        if (payload != null) {
-            argv_buf[argc] = "--data-binary";
-            argc += 1;
-            argv_buf[argc] = "@-";
-            argc += 1;
+        alloc.free(response.headers);
+        if (response.status < 100 or response.status > 599) {
+            alloc.free(response.body);
+            return error.ApiInvalidResponse;
         }
-
-        argv_buf[argc] = "--write-out";
-        argc += 1;
-        argv_buf[argc] = "\n%{http_code}";
-        argc += 1;
-        argv_buf[argc] = url;
-        argc += 1;
-
-        var child = std_compat.process.Child.init(argv_buf[0..argc], alloc);
-        child.stdin_behavior = if (payload != null) .Pipe else .Ignore;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-
-        child.spawn() catch return error.ApiConnectionError;
-
-        if (payload) |body| {
-            if (child.stdin) |stdin_file| {
-                stdin_file.writeAll(body) catch {
-                    stdin_file.close();
-                    child.stdin = null;
-                    _ = child.kill() catch {};
-                    _ = child.wait() catch {};
-                    return error.ApiConnectionError;
-                };
-                stdin_file.close();
-                child.stdin = null;
-            } else {
-                _ = child.kill() catch {};
-                _ = child.wait() catch {};
-                return error.ApiConnectionError;
-            }
-        }
-
-        const raw_out = child.stdout.?.readToEndAlloc(alloc, 16 * 1024 * 1024) catch {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return error.ApiConnectionError;
-        };
-        defer alloc.free(raw_out);
-
-        const term = child.wait() catch return error.ApiConnectionError;
-        switch (term) {
-            .exited => |code| {
-                if (code != 0) {
-                    if (code == 28) return error.ApiTimeout;
-                    return error.ApiConnectionError;
-                }
-            },
-            else => return error.ApiConnectionError,
-        }
-
-        return parseCurlOutput(alloc, raw_out);
-    }
-
-    fn parseCurlOutput(alloc: Allocator, raw_out: []const u8) !HttpResponse {
-        const sep = std.mem.lastIndexOfScalar(u8, raw_out, '\n') orelse return error.ApiInvalidResponse;
-        const code_slice = std.mem.trim(u8, raw_out[sep + 1 ..], " \r\n\t");
-        if (code_slice.len == 0) return error.ApiInvalidResponse;
-
-        const status_code = std.fmt.parseInt(u10, code_slice, 10) catch return error.ApiInvalidResponse;
-        const body = try alloc.dupe(u8, raw_out[0..sep]);
-        return .{
-            .status = @enumFromInt(status_code),
-            .body = body,
-        };
+        return .{ .status = @enumFromInt(@as(u10, @intCast(response.status))), .body = response.body };
     }
 
     // ── URL builders ─────────────────────────────────────────────
@@ -1570,28 +1496,6 @@ test "api parse count missing field" {
     ;
     const result = ApiMemory.parseCount(alloc, json);
     try std.testing.expectError(error.ApiInvalidResponse, result);
-}
-
-test "api parse curl output with body" {
-    const out =
-        \\{"entry":{"id":"1"}}
-        \\200
-    ;
-    const parsed = try ApiMemory.parseCurlOutput(std.testing.allocator, out);
-    defer std.testing.allocator.free(parsed.body);
-    try std.testing.expect(parsed.status == .ok);
-    try std.testing.expectEqualStrings("{\"entry\":{\"id\":\"1\"}}", parsed.body);
-}
-
-test "api parse curl output with empty body" {
-    const out =
-        \\
-        \\404
-    ;
-    const parsed = try ApiMemory.parseCurlOutput(std.testing.allocator, out);
-    defer std.testing.allocator.free(parsed.body);
-    try std.testing.expect(parsed.status == .not_found);
-    try std.testing.expectEqual(@as(usize, 0), parsed.body.len);
 }
 
 test "api build store payload" {

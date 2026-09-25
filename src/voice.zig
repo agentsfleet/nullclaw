@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const json_util = @import("json_util.zig");
 const http_util = @import("http_util.zig");
+const native_http = @import("native_http.zig");
 const net_security = @import("net_security.zig");
 
 const log = std.log.scoped(.voice);
@@ -35,8 +36,6 @@ pub const TranscribeError = error{
 } || std.mem.Allocator.Error;
 
 const TEMP_PATH_ATTEMPTS: usize = 16;
-const TRANSCRIBE_CURL_MAX_TIME_SECS = "120";
-const TRANSCRIBE_CURL_CONNECT_TIMEOUT_SECS = "30";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Transcriber vtable interface
@@ -179,7 +178,7 @@ pub fn transcribeFile(
     ) catch return error.ApiRequestFailed;
     defer allocator.free(auth_hdr);
 
-    // POST via curl using --data-binary @tempfile
+    // POST the multipart body from the temporary file
     const resp = curlPostFromFile(
         allocator,
         endpoint,
@@ -358,75 +357,40 @@ fn parseTranscriptionText(allocator: std.mem.Allocator, json_resp: []const u8) !
     return try allocator.dupe(u8, text_val.string);
 }
 
-/// HTTP POST via curl subprocess, reading body from a file on disk.
-/// Used for multipart/form-data where body has already been written to a temp file.
+/// Send a multipart body from disk without buffering it in process memory.
 fn curlPostFromFile(
     allocator: std.mem.Allocator,
     url: []const u8,
     file_path: [:0]const u8,
     headers: []const []const u8,
 ) ![]u8 {
-    const data_arg = try std.fmt.allocPrint(allocator, "@{s}", .{file_path});
-    defer allocator.free(data_arg);
-
-    var argv_buf: [32][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "--max-time";
-    argc += 1;
-    argv_buf[argc] = TRANSCRIBE_CURL_MAX_TIME_SECS;
-    argc += 1;
-    argv_buf[argc] = "--connect-timeout";
-    argc += 1;
-    argv_buf[argc] = TRANSCRIBE_CURL_CONNECT_TIMEOUT_SECS;
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-
-    var prepared_headers = try http_util.prepareCurlHeaderArg(allocator, headers);
-    defer prepared_headers.deinit(allocator);
-    if (prepared_headers.arg) |headers_arg| {
-        if (argc + 2 > argv_buf.len) return error.CurlFailed;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = headers_arg;
-        argc += 1;
+    const file = try std_compat.fs.openFileAbsolute(file_path, .{});
+    defer file.close();
+    const size = (try file.stat()).size;
+    var upload = file;
+    const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
+    defer if (resolve_entry) |entry| allocator.free(entry);
+    const proxy = try http_util.getProxyFromEnv(allocator);
+    defer if (proxy) |value| allocator.free(value);
+    var response = try native_http.perform(allocator, .{
+        .method = .post,
+        .url = url,
+        .body_file = &upload,
+        .body_file_size = size,
+        .headers = headers,
+        .proxy = proxy,
+        .resolve_entry = resolve_entry,
+        .timeout_secs = 120,
+        .connect_timeout_secs = 30,
+        .max_body_bytes = 4 * 1024 * 1024,
+        .interrupt_flag = http_util.currentThreadInterruptFlag(),
+    });
+    if (response.transport_error) |err| {
+        response.deinit(allocator);
+        return err;
     }
-
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = data_arg;
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return error.CurlReadError;
-
-    const term = child.wait() catch return error.CurlWaitError;
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
-        else => {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
-    }
-
-    return stdout;
+    allocator.free(response.headers);
+    return response.body;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
