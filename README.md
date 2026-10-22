@@ -1,3 +1,11 @@
+> [!CAUTION]
+> **This fork is sunset and archived.**
+> [`agentsfleet`](https://github.com/agentsfleet/agentsfleet) has moved to Rust,
+> so this Zig-based fork is no longer used or maintained. See
+> [github.com/agentsfleet/agentsfleet](https://github.com/agentsfleet/agentsfleet)
+> for current work, or [nullclaw/nullclaw](https://github.com/nullclaw/nullclaw)
+> for the upstream project.
+
 Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](https://github.com/nullclaw/nullhub)! (currently in beta)
 
 [nullhub](https://github.com/nullclaw/nullhub) provides a UI layer for the Null ecosystem: simpler nullclaw setup and configuration, orchestration from [nullboiler](https://github.com/nullclaw/nullboiler), observability from [nullwatch](https://github.com/nullclaw/nullwatch), and task tracking from [nulltickets](https://github.com/nullclaw/nulltickets).
